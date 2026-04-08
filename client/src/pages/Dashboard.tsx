@@ -46,11 +46,16 @@ function PasswordGate({ onAuthenticated }: { onAuthenticated: () => void }) {
     setLoading(true);
     setError("");
     try {
-      const res = await fetch("/api/auth", {
+      const API_BASE = "__PORT_5000__".startsWith("__") ? "" : "__PORT_5000__";
+      const res = await fetch(`${API_BASE}/api/auth`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ password }),
       });
+      if (!res.ok && res.status !== 401) {
+        setError(`Server error: ${res.status} ${res.statusText}`);
+        return;
+      }
       const data = await res.json();
       if (data.success) {
         setAppToken(data.token);
@@ -58,8 +63,8 @@ function PasswordGate({ onAuthenticated }: { onAuthenticated: () => void }) {
       } else {
         setError("Incorrect password. Please try again.");
       }
-    } catch {
-      setError("Could not connect to server.");
+    } catch (err: any) {
+      setError(`Could not connect to server: ${err.message}`);
     } finally {
       setLoading(false);
     }
