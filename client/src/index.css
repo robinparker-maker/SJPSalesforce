@@ -1,0 +1,118 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* Finance dashboard palette — deep navy + gold accent */
+    --background: 222 28% 7%;
+    --foreground: 215 20% 90%;
+
+    --card: 222 26% 10%;
+    --card-foreground: 215 20% 90%;
+
+    --popover: 222 26% 10%;
+    --popover-foreground: 215 20% 90%;
+
+    --primary: 43 90% 52%;        /* Gold */
+    --primary-foreground: 222 28% 7%;
+
+    --secondary: 222 20% 16%;
+    --secondary-foreground: 215 20% 80%;
+
+    --muted: 222 20% 14%;
+    --muted-foreground: 215 15% 55%;
+
+    --accent: 222 20% 18%;
+    --accent-foreground: 215 20% 90%;
+
+    --destructive: 0 70% 50%;
+    --destructive-foreground: 215 20% 90%;
+
+    --border: 222 20% 18%;
+    --input: 222 20% 16%;
+    --ring: 43 90% 52%;
+
+    --radius: 0.5rem;
+
+    /* Sidebar */
+    --sidebar-background: 222 30% 6%;
+    --sidebar-foreground: 215 20% 75%;
+    --sidebar-primary: 43 90% 52%;
+    --sidebar-primary-foreground: 222 28% 7%;
+    --sidebar-accent: 222 20% 14%;
+    --sidebar-accent-foreground: 215 20% 85%;
+    --sidebar-border: 222 20% 14%;
+    --sidebar-ring: 43 90% 52%;
+  }
+
+  /* Always dark — finance dashboards default dark */
+  .dark {
+    --background: 222 28% 7%;
+    --foreground: 215 20% 90%;
+    --card: 222 26% 10%;
+    --card-foreground: 215 20% 90%;
+    --popover: 222 26% 10%;
+    --popover-foreground: 215 20% 90%;
+    --primary: 43 90% 52%;
+    --primary-foreground: 222 28% 7%;
+    --secondary: 222 20% 16%;
+    --secondary-foreground: 215 20% 80%;
+    --muted: 222 20% 14%;
+    --muted-foreground: 215 15% 55%;
+    --accent: 222 20% 18%;
+    --accent-foreground: 215 20% 90%;
+    --destructive: 0 70% 50%;
+    --destructive-foreground: 215 20% 90%;
+    --border: 222 20% 18%;
+    --input: 222 20% 16%;
+    --ring: 43 90% 52%;
+    --sidebar-background: 222 30% 6%;
+    --sidebar-foreground: 215 20% 75%;
+    --sidebar-primary: 43 90% 52%;
+    --sidebar-primary-foreground: 222 28% 7%;
+    --sidebar-accent: 222 20% 14%;
+    --sidebar-accent-foreground: 215 20% 85%;
+    --sidebar-border: 222 20% 14%;
+    --sidebar-ring: 43 90% 52%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-family: 'Inter', 'DM Sans', sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+}
+
+/* Tabular numbers for all financial values */
+.tabular-nums {
+  font-variant-numeric: tabular-nums lining-nums;
+}
+
+/* Subtle gold shimmer on status badges */
+.badge-in-force {
+  color: hsl(142 60% 55%);
+  background: hsl(142 60% 10%);
+}
+
+/* Expand row animation */
+.holdings-row {
+  animation: fadeIn 0.2s ease;
+}
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(-4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* Sticky table header */
+.sticky-thead th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: hsl(222 26% 10%);
+}
