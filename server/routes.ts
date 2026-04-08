@@ -22,6 +22,9 @@ function requireAuth(req: any, res: any, next: any) {
 
 export function registerRoutes(httpServer: Server, app: Express) {
 
+  // ── Public health check (no auth) ───────────────────────────────────────────
+  app.get("/health", (_req, res) => res.json({ ok: true }));
+
   // ── Auth check ──────────────────────────────────────────────────────────────
   app.post("/api/auth", (req, res) => {
     const { password } = req.body;

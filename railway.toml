@@ -5,9 +5,8 @@ dockerfilePath = "Dockerfile"
 [deploy]
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 3
+startCommand = "node dist/index.cjs"
 
 [[deploy.healthchecks]]
 type = "http"
-path = "/api/scrape/status"
-# Note: health check path requires auth, so Railway will show a 401 — this is fine.
-# Railway only uses this to detect if the process has crashed (connection refused).
+path = "/health"
