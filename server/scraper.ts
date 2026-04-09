@@ -54,10 +54,9 @@ async function harvestAccountIds(context: BrowserContext): Promise<{ id: string;
       const match = href.match(/\/Account\/([a-zA-Z0-9]+)\/view/);
       if (match && !seen.has(match[1])) {
         seen.add(match[1]);
-        results.push({
-          id: match[1],
-          name: (link as HTMLAnchorElement).innerText.trim(),
-        });
+        const rawName = (link as HTMLAnchorElement).innerText.trim();
+        const cleanName = rawName.replace(/^Account\s*/i, "").replace(/\s*\|.*$/, "").trim();
+        results.push({ id: match[1], name: cleanName || rawName });
       }
     }
     return results;
@@ -114,15 +113,37 @@ async function scrapeClient(
       await page.waitForTimeout(clickedCount * 500 + 3000);
     }
 
-    // ── Dump full page text for parsing ──────────────────────────────────────
-    const fullText = await page.evaluate(() => document.body.innerText);
-    console.log(`[Scraper] Full page text length for ${clientName}: ${fullText.length}`);
+    // ── Dump full page text including shadow DOM ─────────────────────────────
+    // document.body.innerText misses LWC shadow roots — walk them recursively
+    const fullText = await page.evaluate(() => {
+      function getText(root: Document | ShadowRoot | Element): string {
+        let text = "";
+        for (const node of Array.from(root.childNodes)) {
+          if (node.nodeType === Node.TEXT_NODE) {
+            text += node.textContent + "\n";
+          } else if (node.nodeType === Node.ELEMENT_NODE) {
+            const el = node as Element;
+            // Skip invisible elements
+            const style = (el as HTMLElement).style;
+            if (style && (style.display === "none" || style.visibility === "hidden")) continue;
+            // Recurse into shadow root if present
+            if ((el as any).shadowRoot) {
+              text += getText((el as any).shadowRoot);
+            } else {
+              text += getText(el);
+            }
+          }
+        }
+        return text;
+      }
+      return getText(document);
+    });
+    console.log(`[Scraper] Full text length (with shadow DOM) for ${clientName}: ${fullText.length}`);
 
-    // Log a wider snippet around "Plan" or "Investment" to find the data section
-    const investIdx = fullText.toLowerCase().indexOf("investment account");
-    const planIdx = fullText.toLowerCase().indexOf("plan number");
-    const snippet2500 = fullText.slice(Math.max(0, Math.min(investIdx, planIdx) - 50), Math.min(fullText.length, Math.min(investIdx, planIdx) + 2500));
-    console.log(`[Scraper] Investment section snippet for ${clientName}:`, snippet2500);
+    // Log snippet around investment data
+    const investIdx = Math.max(0, fullText.toLowerCase().indexOf("plan number"));
+    const snippet = fullText.slice(Math.max(0, investIdx - 100), Math.min(fullText.length, investIdx + 3000));
+    console.log(`[Scraper] Investment snippet for ${clientName}:`, snippet);
 
     // ── Get total portfolio value ─────────────────────────────────────────────
     const totalMatch = fullText.match(/Total[:\s]+£?([\d,]+\.?\d*)/i);
@@ -160,10 +181,13 @@ async function scrapeClient(
 
     console.log(`[Scraper] Section start line for ${clientName}: ${sectionStart} — "${lines[sectionStart] ?? "not found"}"`);
 
+    // Clean client name — strip any breadcrumb prefix like "Account\n" or " | Account" suffix
+    const cleanName = clientName.replace(/^Account\s*/i, "").replace(/\s*\|.*$/, "").trim();
+
     // Upsert client
     storage.upsertClient({
       id: accountId,
-      name: clientName,
+      name: cleanName,
       totalValue: totalValue ?? undefined,
       lastScraped: new Date().toISOString(),
     });
