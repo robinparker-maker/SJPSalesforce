@@ -16,20 +16,10 @@ export function sessionExists(): boolean {
 
 // ── Validate saved session ────────────────────────────────────────────────────
 export async function isSessionValid(): Promise<boolean> {
-  if (!sessionExists()) return false;
-  const browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext({ storageState: SESSION_FILE });
-  const page = await context.newPage();
-  try {
-    await page.goto(BASE_URL, { timeout: 15000 });
-    await page.waitForTimeout(3000);
-    const url = page.url();
-    await browser.close();
-    return url.includes("lightning") && !url.includes("login");
-  } catch {
-    await browser.close();
-    return false;
-  }
+  // Just check the file exists — skip a full browser validation to avoid
+  // running two Chromium instances simultaneously on constrained cloud envs.
+  // The scrape itself will fail gracefully if the session is actually expired.
+  return sessionExists();
 }
 
 // ── Save session state ────────────────────────────────────────────────────────
@@ -233,7 +223,10 @@ export async function runScrape(): Promise<{ success: boolean; message: string }
       return { success: false, message: "Session expired. Please log in again." };
     }
 
-    const browser = await chromium.launch({ headless: true });
+    const browser = await chromium.launch({
+      headless: true,
+      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+    });
     const context = await browser.newContext({
       storageState: SESSION_FILE,
       viewport: { width: 1440, height: 900 },
