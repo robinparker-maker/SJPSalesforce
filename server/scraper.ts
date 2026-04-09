@@ -12,17 +12,15 @@ const SESSION_FILE = path.join(DATA_DIR, "session.json");
 export function sessionExists(): boolean {
   return fs.existsSync(SESSION_FILE);
 }
-
 export async function isSessionValid(): Promise<boolean> {
   return sessionExists();
 }
-
 export async function saveSession(context: BrowserContext) {
   const state = await context.storageState();
   fs.writeFileSync(SESSION_FILE, JSON.stringify(state, null, 2));
 }
 
-// ── Harvest client Account IDs ────────────────────────────────────────────────
+// ── Harvest client Account IDs from the list view ────────────────────────────
 async function harvestAccountIds(context: BrowserContext): Promise<{ id: string; name: string }[]> {
   const page = await context.newPage();
   await page.goto(`${BASE_URL}/lightning/o/Account/list`, {
@@ -43,12 +41,11 @@ async function harvestAccountIds(context: BrowserContext): Promise<{ id: string;
     const results: { id: string; name: string }[] = [];
     for (const link of links) {
       const href = (link as HTMLAnchorElement).href;
-      const match = href.match(/\/Account\/([a-zA-Z0-9]+)\/view/);
+      const match = href.match(/\/Account\/([a-zA-Z0-9]{15,18})\/view/);
       if (match && !seen.has(match[1])) {
         seen.add(match[1]);
         const rawName = (link as HTMLAnchorElement).innerText.trim();
-        const cleanName = rawName.replace(/^Account\s*/i, "").replace(/\s*\|.*$/, "").trim();
-        results.push({ id: match[1], name: cleanName || rawName });
+        results.push({ id: match[1], name: rawName || match[1] });
       }
     }
     return results;
@@ -59,22 +56,128 @@ async function harvestAccountIds(context: BrowserContext): Promise<{ id: string;
   return accounts;
 }
 
-// ── Wait for a locator with retries ──────────────────────────────────────────
-async function waitForAny(page: Page, selectors: string[], timeout = 20000): Promise<string | null> {
-  const deadline = Date.now() + timeout;
-  while (Date.now() < deadline) {
-    for (const sel of selectors) {
-      try {
-        const el = page.locator(sel).first();
-        if (await el.isVisible({ timeout: 500 })) return sel;
-      } catch {}
-    }
-    await page.waitForTimeout(1000);
+// ── Extract a field value from page text ─────────────────────────────────────
+function extractField(text: string, ...labels: string[]): string {
+  for (const label of labels) {
+    // Look for label followed by value on next non-empty token
+    const idx = text.indexOf(label);
+    if (idx === -1) continue;
+    const after = text.slice(idx + label.length);
+    // Get first non-empty line after label
+    const lines = after.split("\n").map(l => l.trim()).filter(l => l.length > 0 && !l.startsWith("Help ") && !l.startsWith("Edit ") && !l.startsWith("Open "));
+    if (lines[0]) return lines[0];
   }
-  return null;
+  return "";
 }
 
-// ── Scrape one client ─────────────────────────────────────────────────────────
+// ── Scrape one Financial Account record page ──────────────────────────────────
+async function scrapeFinancialAccount(
+  page: Page,
+  faId: string,
+  clientId: string
+): Promise<{ accountDbId: string; planNumber: string } | null> {
+  console.log(`[Scraper] Loading FinancialAccount ${faId}`);
+  await page.goto(`${BASE_URL}/lightning/r/FinServ__FinancialAccount__c/${faId}/view`, {
+    waitUntil: "domcontentloaded",
+    timeout: 60000,
+  });
+  await page.waitForTimeout(8000);
+
+  const pageText = await page.locator("body").innerText().catch(() => "");
+  console.log(`[Scraper] FA ${faId} text length: ${pageText.length}`);
+
+  // Extract fields using label matching
+  const planNumber     = extractField(pageText, "Plan Number\n", "UT00");
+  const currentValue   = extractField(pageText, "Current Value\n", "GBP ");
+  const provider       = extractField(pageText, "Provider\n");
+  const product        = extractField(pageText, "Product\n");
+  const status         = extractField(pageText, "Status\n");
+  const primaryOwner   = extractField(pageText, "Primary Owner\n");
+  const ownershipType  = extractField(pageText, "Trust Classification\n", "Individual Contracts\n");
+  const utFeeder       = extractField(pageText, "UT Feeder?\n");
+  const ihtExempt      = extractField(pageText, "IHT Exempt\n");
+
+  // Plan number fallback: grab UT-prefixed number from text
+  const planMatch = pageText.match(/UT\d{9,}/);
+  const finalPlan = planNumber || (planMatch ? planMatch[0] : faId);
+
+  // Current value: look for GBP pattern
+  const gbpMatch = pageText.match(/GBP\s+([\d,]+\.?\d*)/);
+  const finalValue = currentValue || (gbpMatch ? `£${gbpMatch[1]}` : "");
+
+  const accountDbId = `${clientId}_${finalPlan}`;
+
+  storage.upsertAccount({
+    id: accountDbId,
+    clientId,
+    planNumber: finalPlan,
+    product,
+    provider,
+    currentValue: finalValue,
+    status,
+    primaryOwner,
+    ownershipType,
+    utFeeder,
+    ihtExempt,
+  });
+
+  console.log(`[Scraper] FA saved: ${finalPlan} = ${finalValue}, ${status}, ${provider}`);
+  return { accountDbId, planNumber: finalPlan };
+}
+
+// ── Scrape fund holdings for a Financial Account ──────────────────────────────
+async function scrapeFundHoldings(
+  page: Page,
+  faId: string,
+  accountDbId: string
+): Promise<number> {
+  // Holdings are in a related list on the FinancialAccount page
+  // They're FinServ__Securities__c records — look for them in related list
+  const pageText = await page.locator("body").innerText().catch(() => "");
+
+  // Find securities section
+  const secIdx = pageText.toLowerCase().indexOf("securities");
+  if (secIdx === -1) {
+    console.log(`[Scraper] No securities section found for ${faId}`);
+    return 0;
+  }
+
+  const secText = pageText.slice(secIdx, secIdx + 5000);
+  console.log(`[Scraper] Securities section for ${faId}:`, secText.slice(0, 500));
+
+  // Try to get holdings from table
+  const tableData = await page.evaluate(() => {
+    const results: string[][] = [];
+    for (const table of Array.from(document.querySelectorAll("table"))) {
+      const headers = Array.from(table.querySelectorAll("th")).map(h => h.innerText.trim());
+      const hasFund = headers.some(h => h.toLowerCase().includes("fund") || h.toLowerCase().includes("secur") || h.toLowerCase().includes("name"));
+      if (!hasFund) continue;
+      for (const row of Array.from(table.querySelectorAll("tbody tr"))) {
+        const cells = Array.from(row.querySelectorAll("td")).map(c => c.innerText.trim());
+        if (cells.some(c => c.length > 0)) results.push(cells);
+      }
+    }
+    return results;
+  });
+
+  let count = 0;
+  for (const cells of tableData) {
+    if (cells.length < 2) continue;
+    storage.insertHolding({
+      accountId: accountDbId,
+      fundName: cells[0] ?? "",
+      price: cells[1] ?? "",
+      units: cells[2] ?? "",
+      valuation: cells[3] ?? "",
+      percentageInvested: cells[4] ?? "",
+      securityId: cells[5] ?? "",
+    });
+    count++;
+  }
+  return count;
+}
+
+// ── Scrape one client — get all their Financial Accounts then visit each ──────
 async function scrapeClient(
   context: BrowserContext,
   accountId: string,
@@ -82,140 +185,61 @@ async function scrapeClient(
 ): Promise<void> {
   const page = await context.newPage();
   try {
-    console.log(`[Scraper] Loading account page for ${clientName} (${accountId})`);
+    const cleanName = clientName.replace(/^Account\s*/i, "").replace(/\s*\|.*$/, "").trim();
+    console.log(`[Scraper] Loading account page for ${cleanName} (${accountId})`);
+
     await page.goto(`${BASE_URL}/lightning/r/Account/${accountId}/view`, {
       waitUntil: "domcontentloaded",
       timeout: 60000,
     });
-
-    // Give Lightning time to bootstrap
     await page.waitForTimeout(10000);
 
-    // Screenshot + log all tabs for debugging
-    const screenshotPath = path.join(DATA_DIR, `debug-${accountId}.png`);
-    await page.screenshot({ path: screenshotPath, fullPage: false });
-    console.log(`[Scraper] Screenshot saved: ${screenshotPath}`);
-
-    const allTabs = await page.evaluate(() => {
-      const els = Array.from(document.querySelectorAll('[role="tab"], .slds-tabs__item a, .oneConsoleTabItem, a[data-tab-value]'));
-      return els.map((el: any) => ({
-        text: el.innerText?.trim().slice(0, 80),
-        title: el.getAttribute("title"),
-        label: el.getAttribute("data-label") || el.getAttribute("aria-label"),
-      })).filter((t: any) => t.text || t.title);
-    });
-    console.log(`[Scraper] Tabs on page:`, JSON.stringify(allTabs));
-
-
-    // ── Look for the Investment Accounts tab / related list ───────────────────
-    // SJP uses a tabbed layout — find and click the Investment Accounts tab
-    const investTabSelectors = [
-      'a[title*="Investment Account"]',
-      'a[data-label*="Investment"]',
-      'li[title*="Investment Account"] a',
-      'button[title*="Investment Account"]',
-      '[role="tab"]:has-text("Investment Account")',
-      'a:has-text("Investment Account")',
-      '[role="tab"]:has-text("Investment")' ,
-      'a:has-text("Investment")' ,
-      '[role="tab"]:has-text("Financial")' ,
-      'a:has-text("Financial Account")' ,
-    ];
-
-    const foundTab = await waitForAny(page, investTabSelectors, 15000);
-    if (foundTab) {
-      console.log(`[Scraper] Found Investment tab with selector: ${foundTab}`);
-      await page.locator(foundTab).first().click();
-      await page.waitForTimeout(5000);
-    } else {
-      console.log(`[Scraper] No Investment tab found — trying to scroll to related list`);
-      // Scroll to bottom to trigger lazy-loaded related lists
-      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-      await page.waitForTimeout(5000);
-    }
-
-    // ── Wait for the Financial Account rows to appear ─────────────────────────
-    // FinancialAccount rows have plan numbers — wait for any of these patterns
-    const rowSelectors = [
-      'a[href*="/lightning/r/FinancialAccount"]',
-      'a[href*="FinServ__FinancialAccount"]',
-      '[data-record-id][data-target-selection-name*="FinancialAccount"]',
-      'lightning-formatted-text:has-text("£")',
-      'td[data-label="Current Value"]',
-      'td[data-label="Plan Number"]',
-    ];
-
-    const foundRow = await waitForAny(page, rowSelectors, 20000);
-    console.log(`[Scraper] Financial Account rows found with: ${foundRow ?? "none"}`);
-
-    // ── Extract all Financial Account links (these are the investment accounts) ─
-    const financialAccounts = await page.evaluate(() => {
-      // Get all links to FinancialAccount records
-      const links = Array.from(document.querySelectorAll('a[href*="FinancialAccount"], a[href*="FinServ"]'));
+    // ── Collect all FinancialAccount IDs from the related list ────────────────
+    // They appear as tabs in the console — each has a Salesforce record ID
+    // Also check for links in the page body
+    const faIds = await page.evaluate(() => {
       const seen = new Set<string>();
-      const results: { id: string; href: string; text: string }[] = [];
+      const results: string[] = [];
+
+      // Method 1: links in page
+      const links = Array.from(document.querySelectorAll('a[href*="FinancialAccount"], a[href*="FinServ"]'));
       for (const link of links) {
         const href = (link as HTMLAnchorElement).href;
-        const idMatch = href.match(/\/([a-zA-Z0-9]{15,18})(?:\/view)?$/);
-        if (idMatch && !seen.has(idMatch[1])) {
-          seen.add(idMatch[1]);
-          results.push({
-            id: idMatch[1],
-            href,
-            text: (link as HTMLAnchorElement).innerText.trim(),
-          });
+        const m = href.match(/\/([a-zA-Z0-9]{15,18})(?:\/view)?/);
+        if (m && !seen.has(m[1]) && m[1] !== window.location.pathname.split("/")[4]) {
+          seen.add(m[1]);
+          results.push(m[1]);
         }
       }
-      return results;
-    });
-    console.log(`[Scraper] Found ${financialAccounts.length} FinancialAccount link(s)`);
 
-    // ── Get page text via Playwright's accessibility tree (pierces shadow DOM) ─
-    // Use page.locator('body').innerText() which Playwright resolves through shadow DOM
-    const pageText = await page.locator("body").innerText().catch(() => "");
-    console.log(`[Scraper] Page text length: ${pageText.length}`);
-
-    // Log the section around plan numbers or £ values
-    const gbpIdx = pageText.indexOf("£");
-    const planIdx = pageText.toLowerCase().indexOf("plan");
-    const startIdx = Math.max(0, Math.min(gbpIdx > 0 ? gbpIdx : 99999, planIdx > 0 ? planIdx : 99999) - 200);
-    console.log(`[Scraper] Key section for ${clientName}:`, pageText.slice(startIdx, startIdx + 3000));
-
-    // ── Get total value ───────────────────────────────────────────────────────
-    const totalMatch = pageText.match(/Total[:\s]+£?([\d,]+\.?\d*)/i)
-      ?? pageText.match(/£([\d,]+\.?\d*)\s*\n.*[Tt]otal/);
-    const totalValue = totalMatch ? `£${totalMatch[1]}` : null;
-
-    // ── Click all expand arrows ───────────────────────────────────────────────
-    const expandBtns = page.locator('button[aria-expanded="false"], button[title*="xpand"], button[title*="Show row"]');
-    const expandCount = await expandBtns.count();
-    console.log(`[Scraper] Found ${expandCount} expand buttons`);
-    for (let i = 0; i < expandCount; i++) {
-      try { await expandBtns.nth(i).click({ timeout: 2000 }); await page.waitForTimeout(300); } catch {}
-    }
-    if (expandCount > 0) await page.waitForTimeout(expandCount * 500 + 2000);
-
-    // Get updated text after expanding
-    const expandedText = await page.locator("body").innerText().catch(() => pageText);
-
-    // ── Parse from rows in the DOM ────────────────────────────────────────────
-    // Try to get structured data from table cells using Playwright locators
-    const tableData = await page.evaluate(() => {
-      const results: { headers: string[]; rows: string[][] }[] = [];
-      const tables = document.querySelectorAll("table");
-      for (const table of tables) {
-        const headers = Array.from(table.querySelectorAll("th")).map(h => h.innerText.trim()).filter(Boolean);
-        const rows = Array.from(table.querySelectorAll("tbody tr")).map(row =>
-          Array.from(row.querySelectorAll("td")).map(c => c.innerText.trim())
-        ).filter(row => row.some(c => c.length > 0));
-        if (rows.length > 0) results.push({ headers, rows });
+      // Method 2: tab titles that look like plan numbers (UT...)
+      const tabs = Array.from(document.querySelectorAll('[title*="Financial Account"]'));
+      for (const tab of tabs) {
+        const href = (tab as HTMLAnchorElement).href || tab.closest('a')?.href || "";
+        const m = href.match(/\/([a-zA-Z0-9]{15,18})(?:\/view)?/);
+        if (m && !seen.has(m[1])) {
+          seen.add(m[1]);
+          results.push(m[1]);
+        }
       }
+
       return results;
     });
-    console.log(`[Scraper] Table data found: ${tableData.length} tables, details:`, JSON.stringify(tableData.map(t => ({ headers: t.headers, rowCount: t.rows.length, firstRow: t.rows[0] }))));
 
-    // ── Upsert client ─────────────────────────────────────────────────────────
-    const cleanName = clientName.replace(/^Account\s*/i, "").replace(/\s*\|.*$/, "").trim();
+    console.log(`[Scraper] Found ${faIds.length} FinancialAccount IDs on page: ${JSON.stringify(faIds)}`);
+
+    // ── Get total portfolio value from page text ───────────────────────────────
+    const mainPageText = await page.locator("body").innerText().catch(() => "");
+    const totalMatch = mainPageText.match(/£([\d,]+\.\d{2})/g);
+    // The largest £ value is likely the total
+    let totalValue: string | null = null;
+    if (totalMatch) {
+      const values = totalMatch.map(v => parseFloat(v.replace(/[£,]/g, "")));
+      const max = Math.max(...values);
+      totalValue = `£${max.toLocaleString("en-GB", { minimumFractionDigits: 2 })}`;
+    }
+
+    // Upsert client
     storage.upsertClient({
       id: accountId,
       name: cleanName,
@@ -224,77 +248,46 @@ async function scrapeClient(
     });
     storage.deleteAccountsByClient(accountId);
 
-    // ── Try structured table parse first ─────────────────────────────────────
+    // ── If no FA IDs found via links, try querying the SOQL-like API path ────
+    // Fall back: open the FinancialAccount list filtered by parent account
+    if (faIds.length === 0) {
+      console.log(`[Scraper] No FA links found on main page — trying FinancialAccount list`);
+      await page.goto(
+        `${BASE_URL}/lightning/o/FinServ__FinancialAccount__c/list`,
+        { waitUntil: "domcontentloaded", timeout: 60000 }
+      );
+      await page.waitForTimeout(8000);
+
+      const listFaIds = await page.evaluate(() => {
+        const links = Array.from(document.querySelectorAll('a[href*="FinancialAccount"]'));
+        const seen = new Set<string>();
+        const results: string[] = [];
+        for (const link of links) {
+          const href = (link as HTMLAnchorElement).href;
+          const m = href.match(/FinancialAccount[^/]*\/([a-zA-Z0-9]{15,18})\/view/);
+          if (m && !seen.has(m[1])) {
+            seen.add(m[1]);
+            results.push(m[1]);
+          }
+        }
+        return results;
+      });
+      console.log(`[Scraper] Found ${listFaIds.length} FA IDs from list view`);
+      faIds.push(...listFaIds);
+    }
+
+    // ── Visit each Financial Account and extract data ─────────────────────────
     let accountsFound = 0;
     let holdingsFound = 0;
 
-    // Look for an investment table with plan/value headers
-    for (const { headers, rows } of tableData) {
-      const hLower = headers.map(h => h.toLowerCase());
-      const isPlanTable = hLower.some(h => h.includes("plan") || h.includes("current value") || h.includes("product") || h.includes("provider"));
-      if (!isPlanTable) continue;
-
-      console.log(`[Scraper] Found investment table: headers=${JSON.stringify(headers)}, rows=${rows.length}`);
-      let currentAccountId: string | null = null;
-
-      for (const cells of rows) {
-        if (cells.length === 0) continue;
-        const first = cells[0] ?? "";
-
-        // Account row: plan number is typically 6+ digits
-        if (/^\d{5,}$/.test(first)) {
-          const accountDbId = `${accountId}_${first}`;
-          currentAccountId = accountDbId;
-          storage.upsertAccount({
-            id: accountDbId,
-            clientId: accountId,
-            planNumber: first,
-            product: cells[1] ?? "",
-            provider: cells[2] ?? "",
-            currentValue: cells[3] ?? "",
-            status: cells[4] ?? "",
-            primaryOwner: cells[5] ?? "",
-            ownershipType: cells[6] ?? "",
-            utFeeder: cells[7] ?? "",
-            ihtExempt: cells[8] ?? "",
-          });
-          accountsFound++;
-        } else if (currentAccountId && cells.filter(c => c.length > 0).length >= 2) {
-          // Holding row
-          storage.insertHolding({
-            accountId: currentAccountId,
-            fundName: first,
-            price: cells[1] ?? "",
-            units: cells[2] ?? "",
-            valuation: cells[3] ?? "",
-            percentageInvested: cells[4] ?? "",
-            securityId: cells[5] ?? "",
-          });
-          holdingsFound++;
-        }
-      }
-    }
-
-    // ── Fallback: parse from FinancialAccount links + page text ──────────────
-    if (accountsFound === 0 && financialAccounts.length > 0) {
-      console.log(`[Scraper] Falling back to FinancialAccount link parsing`);
-      for (const fa of financialAccounts) {
-        const accountDbId = `${accountId}_${fa.id}`;
-        storage.upsertAccount({
-          id: accountDbId,
-          clientId: accountId,
-          planNumber: fa.text || fa.id,
-          product: "",
-          provider: "",
-          currentValue: "",
-          status: "",
-          primaryOwner: "",
-          ownershipType: "",
-          utFeeder: "",
-          ihtExempt: "",
-        });
+    for (const faId of faIds) {
+      const result = await scrapeFinancialAccount(page, faId, accountId);
+      if (result) {
         accountsFound++;
+        const h = await scrapeFundHoldings(page, faId, result.accountDbId);
+        holdingsFound += h;
       }
+      await page.waitForTimeout(1000);
     }
 
     console.log(`[Scraper] ✓ ${cleanName} — ${accountsFound} accounts, ${holdingsFound} holdings`);
