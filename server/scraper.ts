@@ -91,6 +91,22 @@ async function scrapeClient(
     // Give Lightning time to bootstrap
     await page.waitForTimeout(10000);
 
+    // Screenshot + log all tabs for debugging
+    const screenshotPath = path.join(DATA_DIR, `debug-${accountId}.png`);
+    await page.screenshot({ path: screenshotPath, fullPage: false });
+    console.log(`[Scraper] Screenshot saved: ${screenshotPath}`);
+
+    const allTabs = await page.evaluate(() => {
+      const els = Array.from(document.querySelectorAll('[role="tab"], .slds-tabs__item a, .oneConsoleTabItem, a[data-tab-value]'));
+      return els.map((el: any) => ({
+        text: el.innerText?.trim().slice(0, 80),
+        title: el.getAttribute("title"),
+        label: el.getAttribute("data-label") || el.getAttribute("aria-label"),
+      })).filter((t: any) => t.text || t.title);
+    });
+    console.log(`[Scraper] Tabs on page:`, JSON.stringify(allTabs));
+
+
     // ── Look for the Investment Accounts tab / related list ───────────────────
     // SJP uses a tabbed layout — find and click the Investment Accounts tab
     const investTabSelectors = [
@@ -100,6 +116,10 @@ async function scrapeClient(
       'button[title*="Investment Account"]',
       '[role="tab"]:has-text("Investment Account")',
       'a:has-text("Investment Account")',
+      '[role="tab"]:has-text("Investment")' ,
+      'a:has-text("Investment")' ,
+      '[role="tab"]:has-text("Financial")' ,
+      'a:has-text("Financial Account")' ,
     ];
 
     const foundTab = await waitForAny(page, investTabSelectors, 15000);
