@@ -18,7 +18,6 @@ export function sessionExists(): boolean {
 export async function isSessionValid(): Promise<boolean> {
   // Just check the file exists — skip a full browser validation to avoid
   // running two Chromium instances simultaneously on constrained cloud envs.
-  // The scrape itself will fail gracefully if the session is actually expired.
   return sessionExists();
 }
 
@@ -82,133 +81,86 @@ async function scrapeClient(
       timeout: 60000,
     });
 
-    // Scroll down to trigger lazy-loaded Lightning components
+    // Wait for Lightning components to fully render, then scroll to trigger lazy load
     await page.waitForTimeout(8000);
     await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
     await page.waitForTimeout(5000);
     await page.evaluate(() => window.scrollTo(0, 0));
     await page.waitForTimeout(3000);
 
-    // Debug: dump visible text and table count
-    const pageDebug = await page.evaluate(() => {
-      // Attempt to pierce shadow DOM for lightning-datatable
-      function getAllTables(root: Document | ShadowRoot): HTMLTableElement[] {
-        const tables = Array.from(root.querySelectorAll("table")) as HTMLTableElement[];
-        const shadowHosts = root.querySelectorAll("*");
-        for (const host of shadowHosts) {
-          if ((host as any).shadowRoot) {
-            tables.push(...getAllTables((host as any).shadowRoot));
-          }
-        }
-        return tables;
-      }
-      const allTables = getAllTables(document);
-      return {
-        url: window.location.href,
-        tableCount: allTables.length,
-        tables: allTables.map((t, i) => ({
-          index: i,
-          headers: Array.from(t.querySelectorAll("th")).map(h => (h as HTMLElement).innerText.trim()).filter(Boolean),
-          rowCount: t.querySelectorAll("tbody tr").length,
-        })),
-        // Sample of visible text to understand page state
-        bodySnippet: document.body.innerText.slice(0, 500),
-      };
-    });
-    console.log(`[Scraper] Page debug for ${clientName}:`, JSON.stringify(pageDebug));
-
-    // ── Find the investment accounts table (including shadow DOM) ───────────
-    // Use Playwright's built-in ability to evaluate inside shadow roots
-    const tableIndex = await page.evaluate(() => {
-      function getAllTables(root: Document | ShadowRoot): HTMLTableElement[] {
-        const tables = Array.from(root.querySelectorAll("table")) as HTMLTableElement[];
-        const shadowHosts = root.querySelectorAll("*");
-        for (const host of shadowHosts) {
-          if ((host as any).shadowRoot) {
-            tables.push(...getAllTables((host as any).shadowRoot));
-          }
-        }
-        return tables;
-      }
-      const allTables = getAllTables(document);
-      // First pass: investment-specific headers
-      for (let i = 0; i < allTables.length; i++) {
-        const headers = Array.from(allTables[i].querySelectorAll("th")).map(h =>
-          (h as HTMLElement).innerText.trim().toLowerCase()
-        );
-        if (headers.some(h => h.includes("plan") || h.includes("current value") || h.includes("provider") || h.includes("product"))) {
-          return i;
-        }
-      }
-      // Second pass: largest table by row count
-      let bestIdx = -1, bestRows = 0;
-      for (let i = 0; i < allTables.length; i++) {
-        const rows = allTables[i].querySelectorAll("tbody tr").length;
-        if (rows > bestRows) { bestRows = rows; bestIdx = i; }
-      }
-      return bestRows > 0 ? bestIdx : -1;
-    });
-
-    if (tableIndex === -1) {
-      console.log(`[Scraper] No table found for ${clientName} after shadow DOM search`);
-      await page.close();
-      return;
-    }
-    console.log(`[Scraper] Using table index ${tableIndex} for ${clientName}`);
-
-    // Shadow-DOM-aware table getter (serialised as string for page.evaluate)
-    const GET_TABLES = `(function getAllTables(root){const t=Array.from(root.querySelectorAll('table'));for(const h of root.querySelectorAll('*')){if(h.shadowRoot)t.push(...getAllTables(h.shadowRoot));}return t;})(document)`;
-
-    // ── Extract column headers ──────────────────────────────────────────────
-    const headers = await page.evaluate(([idx, expr]) => {
-      const allTables = eval(expr);
-      return Array.from(allTables[idx].querySelectorAll("th"))
-        .map((h: any) => h.innerText.trim())
-        .filter((h: string) => h.length > 0);
-    }, [tableIndex, GET_TABLES] as [number, string]);
-
-    // ── Get total portfolio value ───────────────────────────────────────────
-    const totalValue = await page.evaluate(() => {
-      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-      let node: Text | null;
-      while ((node = walker.nextNode() as Text | null)) {
-        const text = node.textContent?.trim() ?? "";
-        if (text.startsWith("Total:")) return text.replace("Total:", "").trim();
-      }
-      return null;
-    });
-
-    // ── Click every expand arrow ────────────────────────────────────────────
-    const clickedCount = await page.evaluate(([idx, expr]) => {
-      const allTables = eval(expr);
-      const table = allTables[idx];
-      const rows = Array.from(table.querySelectorAll("tbody > tr"));
+    // ── Click all expand arrows (buttons in the investment component) ─────────
+    // We do this before extracting so fund holdings are visible
+    const clickedCount = await page.evaluate(() => {
+      // Try multiple selectors for expand/chevron buttons
+      const selectors = [
+        'button[aria-expanded="false"]',
+        'button[title*="xpand"]',
+        'button[title*="Show"]',
+        'lightning-primitive-icon[svg-class*="chevron"]',
+        '.slds-button[title*="xpand"]',
+      ];
       let clicked = 0;
-      for (const row of rows as HTMLTableRowElement[]) {
-        const btn = row.querySelector(
-          'td button[aria-expanded="false"], td button[title*="xpand"], td:first-child button'
-        ) as HTMLButtonElement | null;
-        if (btn) { btn.click(); clicked++; }
+      for (const sel of selectors) {
+        const btns = Array.from(document.querySelectorAll(sel)) as HTMLButtonElement[];
+        for (const btn of btns) {
+          try { btn.click(); clicked++; } catch {}
+        }
       }
       return clicked;
-    }, [tableIndex, GET_TABLES] as [number, string]);
+    });
 
     if (clickedCount > 0) {
-      await page.waitForTimeout(clickedCount * 800 + 2000);
+      console.log(`[Scraper] Clicked ${clickedCount} expand button(s) for ${clientName}`);
+      await page.waitForTimeout(clickedCount * 500 + 3000);
     }
 
-    // ── Extract all rows ────────────────────────────────────────────────────
-    const rawRows = await page.evaluate(([idx, expr]) => {
-      const allTables = eval(expr);
-      const table = allTables[idx];
-      return Array.from(table.querySelectorAll("tbody tr")).map((row: any) => ({
-        cells: Array.from(row.querySelectorAll("td")).map((c: any) => c.innerText.trim()),
-        cellCount: row.querySelectorAll("td").length,
-      }));
-    }, [tableIndex, GET_TABLES] as [number, string]);
+    // ── Dump full page text for parsing ──────────────────────────────────────
+    const fullText = await page.evaluate(() => document.body.innerText);
+    console.log(`[Scraper] Full page text length for ${clientName}: ${fullText.length}`);
 
-    // ── Parse rows into accounts + holdings ────────────────────────────────
-    // Upsert client first
+    // Log a wider snippet around "Plan" or "Investment" to find the data section
+    const investIdx = fullText.toLowerCase().indexOf("investment account");
+    const planIdx = fullText.toLowerCase().indexOf("plan number");
+    const snippet2500 = fullText.slice(Math.max(0, Math.min(investIdx, planIdx) - 50), Math.min(fullText.length, Math.min(investIdx, planIdx) + 2500));
+    console.log(`[Scraper] Investment section snippet for ${clientName}:`, snippet2500);
+
+    // ── Get total portfolio value ─────────────────────────────────────────────
+    const totalMatch = fullText.match(/Total[:\s]+£?([\d,]+\.?\d*)/i);
+    const totalValue = totalMatch ? `£${totalMatch[1]}` : null;
+
+    // ── Parse the investment section from page text ───────────────────────────
+    // The SJP LWC renders rows as lines of text. We look for the section
+    // after "Investment Accounts" header and parse line by line.
+    //
+    // Known column order (from earlier screenshots):
+    // Account rows: Plan Number | Product | Provider | Current Value | Status | Primary Owner | Ownership Type | UT Feeder | IHT Exempt
+    // Holding rows: Fund Name | Price | Units | Valuation | % Invested | Security ID
+
+    const lines = fullText.split("\n").map(l => l.trim()).filter(l => l.length > 0);
+
+    // Find start of investment accounts section
+    let sectionStart = -1;
+    for (let i = 0; i < lines.length; i++) {
+      const l = lines[i].toLowerCase();
+      if (l.includes("plan number") || (l.includes("investment account") && lines[i + 1]?.toLowerCase().includes("plan"))) {
+        sectionStart = i;
+        break;
+      }
+    }
+
+    if (sectionStart === -1) {
+      // Fallback: look for lines that look like plan numbers (6-digit numbers)
+      for (let i = 0; i < lines.length; i++) {
+        if (/^\d{6,}$/.test(lines[i])) {
+          sectionStart = i;
+          break;
+        }
+      }
+    }
+
+    console.log(`[Scraper] Section start line for ${clientName}: ${sectionStart} — "${lines[sectionStart] ?? "not found"}"`);
+
+    // Upsert client
     storage.upsertClient({
       id: accountId,
       name: clientName,
@@ -216,22 +168,43 @@ async function scrapeClient(
       lastScraped: new Date().toISOString(),
     });
 
-    // Clear existing data for this client
     storage.deleteAccountsByClient(accountId);
 
+    if (sectionStart === -1) {
+      console.log(`[Scraper] Could not find investment section for ${clientName}`);
+      return;
+    }
+
+    // ── Walk lines and parse accounts + holdings ──────────────────────────────
+    // Plan numbers are 6+ digit numbers. Holdings have fund names (text) followed by price/units.
     let currentAccountId: string | null = null;
-    const fullColCount = headers.length;
+    let i = sectionStart;
+    let accountsFound = 0;
+    let holdingsFound = 0;
 
-    for (const row of rawRows) {
-      const { cells, cellCount } = row;
-      if (cells.length === 0) continue;
+    // Skip header row(s)
+    while (i < lines.length && (lines[i].toLowerCase().includes("plan number") || lines[i].toLowerCase().includes("product") || lines[i].toLowerCase().includes("provider"))) {
+      i++;
+    }
 
-      const firstCell = cells[0] ?? "";
-      const isAccountRow = firstCell.length > 0 && cellCount >= Math.max(fullColCount - 2, 5);
-      const isHoldingRow = !isAccountRow && currentAccountId && cells.filter(c => c.length > 0).length >= 3;
+    while (i < lines.length) {
+      const line = lines[i];
 
-      if (isAccountRow) {
-        const planNumber = firstCell;
+      // Stop if we've left the investment section (hit another major section)
+      if (line.toLowerCase().match(/^(activity|chatter|files|notes|tasks|opportunities|cases|contacts|related)/)) break;
+
+      // Account row: starts with a plan number (6+ digits)
+      if (/^\d{5,}$/.test(line)) {
+        const planNumber = line;
+        const product    = lines[i + 1] ?? "";
+        const provider   = lines[i + 2] ?? "";
+        const currVal    = lines[i + 3] ?? "";
+        const status     = lines[i + 4] ?? "";
+        const owner      = lines[i + 5] ?? "";
+        const ownerType  = lines[i + 6] ?? "";
+        const utFeeder   = lines[i + 7] ?? "";
+        const ihtExempt  = lines[i + 8] ?? "";
+
         const accountDbId = `${accountId}_${planNumber}`;
         currentAccountId = accountDbId;
 
@@ -239,29 +212,50 @@ async function scrapeClient(
           id: accountDbId,
           clientId: accountId,
           planNumber,
-          product: cells[1] ?? "",
-          provider: cells[2] ?? "",
-          currentValue: cells[3] ?? "",
-          status: cells[4] ?? "",
-          primaryOwner: cells[5] ?? "",
-          ownershipType: cells[6] ?? "",
-          utFeeder: cells[7] ?? "",
-          ihtExempt: cells[8] ?? "",
+          product,
+          provider,
+          currentValue: currVal,
+          status,
+          primaryOwner: owner,
+          ownershipType: ownerType,
+          utFeeder,
+          ihtExempt,
         });
-      } else if (isHoldingRow && currentAccountId) {
+        accountsFound++;
+        i += 9; // skip the columns we consumed
+        continue;
+      }
+
+      // Holding row heuristic: a currency price like "£1.234" or "1.2345" followed
+      // by a number (units) — meaning: line = fund name, line+1 = price, line+2 = units
+      const nextLine = lines[i + 1] ?? "";
+      const isPriceLike = /^£?[\d,]+\.?\d*$/.test(nextLine) || /^\d+\.\d{3,}$/.test(nextLine);
+      if (currentAccountId && line.length > 2 && isPriceLike && !/^\d{5,}$/.test(line)) {
+        const fundName  = line;
+        const price     = lines[i + 1] ?? "";
+        const units     = lines[i + 2] ?? "";
+        const valuation = lines[i + 3] ?? "";
+        const pctInv    = lines[i + 4] ?? "";
+        const secId     = lines[i + 5] ?? "";
+
         storage.insertHolding({
           accountId: currentAccountId,
-          fundName: cells[0] ?? "",
-          price: cells[1] ?? "",
-          units: cells[2] ?? "",
-          valuation: cells[3] ?? "",
-          percentageInvested: cells[4] ?? "",
-          securityId: cells[5] ?? "",
+          fundName,
+          price,
+          units,
+          valuation,
+          percentageInvested: pctInv,
+          securityId: secId,
         });
+        holdingsFound++;
+        i += 6;
+        continue;
       }
+
+      i++;
     }
 
-    console.log(`[Scraper] ✓ ${clientName} — saved ${rawRows.length} rows`);
+    console.log(`[Scraper] ✓ ${clientName} — ${accountsFound} accounts, ${holdingsFound} holdings`);
   } finally {
     await page.close();
   }
