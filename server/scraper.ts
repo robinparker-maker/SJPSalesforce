@@ -1,10 +1,9 @@
-import { chromium, type BrowserContext } from "playwright";
+import { chromium, type BrowserContext, type Page } from "playwright";
 import fs from "fs";
 import path from "path";
 import { storage } from "./storage";
 
 const BASE_URL = "https://sjp2.lightning.force.com";
-// Use /data dir when DATABASE_URL points there (Railway volume), otherwise cwd
 const DATA_DIR = process.env.DATABASE_URL
   ? path.dirname(process.env.DATABASE_URL)
   : process.cwd();
@@ -14,37 +13,30 @@ export function sessionExists(): boolean {
   return fs.existsSync(SESSION_FILE);
 }
 
-// ── Validate saved session ────────────────────────────────────────────────────
 export async function isSessionValid(): Promise<boolean> {
-  // Just check the file exists — skip a full browser validation to avoid
-  // running two Chromium instances simultaneously on constrained cloud envs.
   return sessionExists();
 }
 
-// ── Save session state ────────────────────────────────────────────────────────
 export async function saveSession(context: BrowserContext) {
   const state = await context.storageState();
   fs.writeFileSync(SESSION_FILE, JSON.stringify(state, null, 2));
 }
 
-// ── Harvest all client Account IDs from the Accounts list view ───────────────
+// ── Harvest client Account IDs ────────────────────────────────────────────────
 async function harvestAccountIds(context: BrowserContext): Promise<{ id: string; name: string }[]> {
   const page = await context.newPage();
   await page.goto(`${BASE_URL}/lightning/o/Account/list`, {
     waitUntil: "domcontentloaded",
     timeout: 60000,
   });
-  // Wait for Lightning to fully render
   await page.waitForTimeout(8000);
 
-  // Detect SSO redirect — if we're not on Lightning, session has expired
   const currentUrl = page.url();
   if (!currentUrl.includes("lightning.force.com") && !currentUrl.includes("sjp2")) {
     await page.close();
     throw new Error(`Session expired — redirected to: ${currentUrl}. Please log in again.`);
   }
 
-  // Collect all client links from the list — they link to /lightning/r/Account/{ID}/view
   const accounts = await page.evaluate(() => {
     const links = Array.from(document.querySelectorAll('a[href*="/lightning/r/Account/"]'));
     const seen = new Set<string>();
@@ -67,7 +59,22 @@ async function harvestAccountIds(context: BrowserContext): Promise<{ id: string;
   return accounts;
 }
 
-// ── Scrape one client's investment accounts + holdings ────────────────────────
+// ── Wait for a locator with retries ──────────────────────────────────────────
+async function waitForAny(page: Page, selectors: string[], timeout = 20000): Promise<string | null> {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    for (const sel of selectors) {
+      try {
+        const el = page.locator(sel).first();
+        if (await el.isVisible({ timeout: 500 })) return sel;
+      } catch {}
+    }
+    await page.waitForTimeout(1000);
+  }
+  return null;
+}
+
+// ── Scrape one client ─────────────────────────────────────────────────────────
 async function scrapeClient(
   context: BrowserContext,
   accountId: string,
@@ -75,211 +82,202 @@ async function scrapeClient(
 ): Promise<void> {
   const page = await context.newPage();
   try {
+    console.log(`[Scraper] Loading account page for ${clientName} (${accountId})`);
     await page.goto(`${BASE_URL}/lightning/r/Account/${accountId}/view`, {
       waitUntil: "domcontentloaded",
       timeout: 60000,
     });
 
-    // Wait for Lightning components to fully render, then scroll to trigger lazy load
-    await page.waitForTimeout(8000);
-    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-    await page.waitForTimeout(5000);
-    await page.evaluate(() => window.scrollTo(0, 0));
-    await page.waitForTimeout(3000);
+    // Give Lightning time to bootstrap
+    await page.waitForTimeout(10000);
 
-    // ── Click all expand arrows (buttons in the investment component) ─────────
-    // We do this before extracting so fund holdings are visible
-    const clickedCount = await page.evaluate(() => {
-      // Try multiple selectors for expand/chevron buttons
-      const selectors = [
-        'button[aria-expanded="false"]',
-        'button[title*="xpand"]',
-        'button[title*="Show"]',
-        'lightning-primitive-icon[svg-class*="chevron"]',
-        '.slds-button[title*="xpand"]',
-      ];
-      let clicked = 0;
-      for (const sel of selectors) {
-        const btns = Array.from(document.querySelectorAll(sel)) as HTMLButtonElement[];
-        for (const btn of btns) {
-          try { btn.click(); clicked++; } catch {}
-        }
-      }
-      return clicked;
-    });
+    // ── Look for the Investment Accounts tab / related list ───────────────────
+    // SJP uses a tabbed layout — find and click the Investment Accounts tab
+    const investTabSelectors = [
+      'a[title*="Investment Account"]',
+      'a[data-label*="Investment"]',
+      'li[title*="Investment Account"] a',
+      'button[title*="Investment Account"]',
+      '[role="tab"]:has-text("Investment Account")',
+      'a:has-text("Investment Account")',
+    ];
 
-    if (clickedCount > 0) {
-      console.log(`[Scraper] Clicked ${clickedCount} expand button(s) for ${clientName}`);
-      await page.waitForTimeout(clickedCount * 500 + 3000);
+    const foundTab = await waitForAny(page, investTabSelectors, 15000);
+    if (foundTab) {
+      console.log(`[Scraper] Found Investment tab with selector: ${foundTab}`);
+      await page.locator(foundTab).first().click();
+      await page.waitForTimeout(5000);
+    } else {
+      console.log(`[Scraper] No Investment tab found — trying to scroll to related list`);
+      // Scroll to bottom to trigger lazy-loaded related lists
+      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+      await page.waitForTimeout(5000);
     }
 
-    // ── Dump full page text including shadow DOM ─────────────────────────────
-    // document.body.innerText misses LWC shadow roots — walk them recursively
-    const fullText = await page.evaluate(() => {
-      function getText(root: Document | ShadowRoot | Element): string {
-        let text = "";
-        for (const node of Array.from(root.childNodes)) {
-          if (node.nodeType === Node.TEXT_NODE) {
-            text += node.textContent + "\n";
-          } else if (node.nodeType === Node.ELEMENT_NODE) {
-            const el = node as Element;
-            // Skip invisible elements
-            const style = (el as HTMLElement).style;
-            if (style && (style.display === "none" || style.visibility === "hidden")) continue;
-            // Recurse into shadow root if present
-            if ((el as any).shadowRoot) {
-              text += getText((el as any).shadowRoot);
-            } else {
-              text += getText(el);
-            }
-          }
+    // ── Wait for the Financial Account rows to appear ─────────────────────────
+    // FinancialAccount rows have plan numbers — wait for any of these patterns
+    const rowSelectors = [
+      'a[href*="/lightning/r/FinancialAccount"]',
+      'a[href*="FinServ__FinancialAccount"]',
+      '[data-record-id][data-target-selection-name*="FinancialAccount"]',
+      'lightning-formatted-text:has-text("£")',
+      'td[data-label="Current Value"]',
+      'td[data-label="Plan Number"]',
+    ];
+
+    const foundRow = await waitForAny(page, rowSelectors, 20000);
+    console.log(`[Scraper] Financial Account rows found with: ${foundRow ?? "none"}`);
+
+    // ── Extract all Financial Account links (these are the investment accounts) ─
+    const financialAccounts = await page.evaluate(() => {
+      // Get all links to FinancialAccount records
+      const links = Array.from(document.querySelectorAll('a[href*="FinancialAccount"], a[href*="FinServ"]'));
+      const seen = new Set<string>();
+      const results: { id: string; href: string; text: string }[] = [];
+      for (const link of links) {
+        const href = (link as HTMLAnchorElement).href;
+        const idMatch = href.match(/\/([a-zA-Z0-9]{15,18})(?:\/view)?$/);
+        if (idMatch && !seen.has(idMatch[1])) {
+          seen.add(idMatch[1]);
+          results.push({
+            id: idMatch[1],
+            href,
+            text: (link as HTMLAnchorElement).innerText.trim(),
+          });
         }
-        return text;
       }
-      return getText(document);
+      return results;
     });
-    console.log(`[Scraper] Full text length (with shadow DOM) for ${clientName}: ${fullText.length}`);
+    console.log(`[Scraper] Found ${financialAccounts.length} FinancialAccount link(s)`);
 
-    // Log snippet around investment data
-    const investIdx = Math.max(0, fullText.toLowerCase().indexOf("plan number"));
-    const snippet = fullText.slice(Math.max(0, investIdx - 100), Math.min(fullText.length, investIdx + 3000));
-    console.log(`[Scraper] Investment snippet for ${clientName}:`, snippet);
+    // ── Get page text via Playwright's accessibility tree (pierces shadow DOM) ─
+    // Use page.locator('body').innerText() which Playwright resolves through shadow DOM
+    const pageText = await page.locator("body").innerText().catch(() => "");
+    console.log(`[Scraper] Page text length: ${pageText.length}`);
 
-    // ── Get total portfolio value ─────────────────────────────────────────────
-    const totalMatch = fullText.match(/Total[:\s]+£?([\d,]+\.?\d*)/i);
+    // Log the section around plan numbers or £ values
+    const gbpIdx = pageText.indexOf("£");
+    const planIdx = pageText.toLowerCase().indexOf("plan");
+    const startIdx = Math.max(0, Math.min(gbpIdx > 0 ? gbpIdx : 99999, planIdx > 0 ? planIdx : 99999) - 200);
+    console.log(`[Scraper] Key section for ${clientName}:`, pageText.slice(startIdx, startIdx + 3000));
+
+    // ── Get total value ───────────────────────────────────────────────────────
+    const totalMatch = pageText.match(/Total[:\s]+£?([\d,]+\.?\d*)/i)
+      ?? pageText.match(/£([\d,]+\.?\d*)\s*\n.*[Tt]otal/);
     const totalValue = totalMatch ? `£${totalMatch[1]}` : null;
 
-    // ── Parse the investment section from page text ───────────────────────────
-    // The SJP LWC renders rows as lines of text. We look for the section
-    // after "Investment Accounts" header and parse line by line.
-    //
-    // Known column order (from earlier screenshots):
-    // Account rows: Plan Number | Product | Provider | Current Value | Status | Primary Owner | Ownership Type | UT Feeder | IHT Exempt
-    // Holding rows: Fund Name | Price | Units | Valuation | % Invested | Security ID
-
-    const lines = fullText.split("\n").map(l => l.trim()).filter(l => l.length > 0);
-
-    // Find start of investment accounts section
-    let sectionStart = -1;
-    for (let i = 0; i < lines.length; i++) {
-      const l = lines[i].toLowerCase();
-      if (l.includes("plan number") || (l.includes("investment account") && lines[i + 1]?.toLowerCase().includes("plan"))) {
-        sectionStart = i;
-        break;
-      }
+    // ── Click all expand arrows ───────────────────────────────────────────────
+    const expandBtns = page.locator('button[aria-expanded="false"], button[title*="xpand"], button[title*="Show row"]');
+    const expandCount = await expandBtns.count();
+    console.log(`[Scraper] Found ${expandCount} expand buttons`);
+    for (let i = 0; i < expandCount; i++) {
+      try { await expandBtns.nth(i).click({ timeout: 2000 }); await page.waitForTimeout(300); } catch {}
     }
+    if (expandCount > 0) await page.waitForTimeout(expandCount * 500 + 2000);
 
-    if (sectionStart === -1) {
-      // Fallback: look for lines that look like plan numbers (6-digit numbers)
-      for (let i = 0; i < lines.length; i++) {
-        if (/^\d{6,}$/.test(lines[i])) {
-          sectionStart = i;
-          break;
-        }
+    // Get updated text after expanding
+    const expandedText = await page.locator("body").innerText().catch(() => pageText);
+
+    // ── Parse from rows in the DOM ────────────────────────────────────────────
+    // Try to get structured data from table cells using Playwright locators
+    const tableData = await page.evaluate(() => {
+      const results: { headers: string[]; rows: string[][] }[] = [];
+      const tables = document.querySelectorAll("table");
+      for (const table of tables) {
+        const headers = Array.from(table.querySelectorAll("th")).map(h => h.innerText.trim()).filter(Boolean);
+        const rows = Array.from(table.querySelectorAll("tbody tr")).map(row =>
+          Array.from(row.querySelectorAll("td")).map(c => c.innerText.trim())
+        ).filter(row => row.some(c => c.length > 0));
+        if (rows.length > 0) results.push({ headers, rows });
       }
-    }
+      return results;
+    });
+    console.log(`[Scraper] Table data found: ${tableData.length} tables, details:`, JSON.stringify(tableData.map(t => ({ headers: t.headers, rowCount: t.rows.length, firstRow: t.rows[0] }))));
 
-    console.log(`[Scraper] Section start line for ${clientName}: ${sectionStart} — "${lines[sectionStart] ?? "not found"}"`);
-
-    // Clean client name — strip any breadcrumb prefix like "Account\n" or " | Account" suffix
+    // ── Upsert client ─────────────────────────────────────────────────────────
     const cleanName = clientName.replace(/^Account\s*/i, "").replace(/\s*\|.*$/, "").trim();
-
-    // Upsert client
     storage.upsertClient({
       id: accountId,
       name: cleanName,
       totalValue: totalValue ?? undefined,
       lastScraped: new Date().toISOString(),
     });
-
     storage.deleteAccountsByClient(accountId);
 
-    if (sectionStart === -1) {
-      console.log(`[Scraper] Could not find investment section for ${clientName}`);
-      return;
-    }
-
-    // ── Walk lines and parse accounts + holdings ──────────────────────────────
-    // Plan numbers are 6+ digit numbers. Holdings have fund names (text) followed by price/units.
-    let currentAccountId: string | null = null;
-    let i = sectionStart;
+    // ── Try structured table parse first ─────────────────────────────────────
     let accountsFound = 0;
     let holdingsFound = 0;
 
-    // Skip header row(s)
-    while (i < lines.length && (lines[i].toLowerCase().includes("plan number") || lines[i].toLowerCase().includes("product") || lines[i].toLowerCase().includes("provider"))) {
-      i++;
+    // Look for an investment table with plan/value headers
+    for (const { headers, rows } of tableData) {
+      const hLower = headers.map(h => h.toLowerCase());
+      const isPlanTable = hLower.some(h => h.includes("plan") || h.includes("current value") || h.includes("product") || h.includes("provider"));
+      if (!isPlanTable) continue;
+
+      console.log(`[Scraper] Found investment table: headers=${JSON.stringify(headers)}, rows=${rows.length}`);
+      let currentAccountId: string | null = null;
+
+      for (const cells of rows) {
+        if (cells.length === 0) continue;
+        const first = cells[0] ?? "";
+
+        // Account row: plan number is typically 6+ digits
+        if (/^\d{5,}$/.test(first)) {
+          const accountDbId = `${accountId}_${first}`;
+          currentAccountId = accountDbId;
+          storage.upsertAccount({
+            id: accountDbId,
+            clientId: accountId,
+            planNumber: first,
+            product: cells[1] ?? "",
+            provider: cells[2] ?? "",
+            currentValue: cells[3] ?? "",
+            status: cells[4] ?? "",
+            primaryOwner: cells[5] ?? "",
+            ownershipType: cells[6] ?? "",
+            utFeeder: cells[7] ?? "",
+            ihtExempt: cells[8] ?? "",
+          });
+          accountsFound++;
+        } else if (currentAccountId && cells.filter(c => c.length > 0).length >= 2) {
+          // Holding row
+          storage.insertHolding({
+            accountId: currentAccountId,
+            fundName: first,
+            price: cells[1] ?? "",
+            units: cells[2] ?? "",
+            valuation: cells[3] ?? "",
+            percentageInvested: cells[4] ?? "",
+            securityId: cells[5] ?? "",
+          });
+          holdingsFound++;
+        }
+      }
     }
 
-    while (i < lines.length) {
-      const line = lines[i];
-
-      // Stop if we've left the investment section (hit another major section)
-      if (line.toLowerCase().match(/^(activity|chatter|files|notes|tasks|opportunities|cases|contacts|related)/)) break;
-
-      // Account row: starts with a plan number (6+ digits)
-      if (/^\d{5,}$/.test(line)) {
-        const planNumber = line;
-        const product    = lines[i + 1] ?? "";
-        const provider   = lines[i + 2] ?? "";
-        const currVal    = lines[i + 3] ?? "";
-        const status     = lines[i + 4] ?? "";
-        const owner      = lines[i + 5] ?? "";
-        const ownerType  = lines[i + 6] ?? "";
-        const utFeeder   = lines[i + 7] ?? "";
-        const ihtExempt  = lines[i + 8] ?? "";
-
-        const accountDbId = `${accountId}_${planNumber}`;
-        currentAccountId = accountDbId;
-
+    // ── Fallback: parse from FinancialAccount links + page text ──────────────
+    if (accountsFound === 0 && financialAccounts.length > 0) {
+      console.log(`[Scraper] Falling back to FinancialAccount link parsing`);
+      for (const fa of financialAccounts) {
+        const accountDbId = `${accountId}_${fa.id}`;
         storage.upsertAccount({
           id: accountDbId,
           clientId: accountId,
-          planNumber,
-          product,
-          provider,
-          currentValue: currVal,
-          status,
-          primaryOwner: owner,
-          ownershipType: ownerType,
-          utFeeder,
-          ihtExempt,
+          planNumber: fa.text || fa.id,
+          product: "",
+          provider: "",
+          currentValue: "",
+          status: "",
+          primaryOwner: "",
+          ownershipType: "",
+          utFeeder: "",
+          ihtExempt: "",
         });
         accountsFound++;
-        i += 9; // skip the columns we consumed
-        continue;
       }
-
-      // Holding row heuristic: a currency price like "£1.234" or "1.2345" followed
-      // by a number (units) — meaning: line = fund name, line+1 = price, line+2 = units
-      const nextLine = lines[i + 1] ?? "";
-      const isPriceLike = /^£?[\d,]+\.?\d*$/.test(nextLine) || /^\d+\.\d{3,}$/.test(nextLine);
-      if (currentAccountId && line.length > 2 && isPriceLike && !/^\d{5,}$/.test(line)) {
-        const fundName  = line;
-        const price     = lines[i + 1] ?? "";
-        const units     = lines[i + 2] ?? "";
-        const valuation = lines[i + 3] ?? "";
-        const pctInv    = lines[i + 4] ?? "";
-        const secId     = lines[i + 5] ?? "";
-
-        storage.insertHolding({
-          accountId: currentAccountId,
-          fundName,
-          price,
-          units,
-          valuation,
-          percentageInvested: pctInv,
-          securityId: secId,
-        });
-        holdingsFound++;
-        i += 6;
-        continue;
-      }
-
-      i++;
     }
 
-    console.log(`[Scraper] ✓ ${clientName} — ${accountsFound} accounts, ${holdingsFound} holdings`);
+    console.log(`[Scraper] ✓ ${cleanName} — ${accountsFound} accounts, ${holdingsFound} holdings`);
   } finally {
     await page.close();
   }
@@ -312,15 +310,11 @@ export async function runScrape(): Promise<{ success: boolean; message: string }
       viewport: { width: 1440, height: 900 },
     });
 
-    // Step 1: harvest all client IDs
     const accounts = await harvestAccountIds(context);
-
     if (accounts.length === 0) {
-      // Fall back to hardcoded test client if list view returns nothing
       accounts.push({ id: "0010800002mkyCaAAI", name: "Rupert William Swallow" });
     }
 
-    // Step 2: scrape each client
     for (const { id, name } of accounts) {
       await scrapeClient(context, id, name);
       await new Promise(r => setTimeout(r, 2000));
