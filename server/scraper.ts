@@ -81,55 +81,91 @@ async function scrapeClient(
       waitUntil: "domcontentloaded",
       timeout: 60000,
     });
-    // Wait for Lightning components to render
-    await page.waitForTimeout(12000);
 
-    // Debug: log all tables found and their headers
-    const tableDebug = await page.evaluate(() => {
-      const tables = document.querySelectorAll("table");
-      return Array.from(tables).map((t, i) => ({
-        index: i,
-        headers: Array.from(t.querySelectorAll("th")).map(h => h.innerText.trim()).filter(Boolean),
-        rowCount: t.querySelectorAll("tbody tr").length,
-      }));
+    // Scroll down to trigger lazy-loaded Lightning components
+    await page.waitForTimeout(8000);
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    await page.waitForTimeout(5000);
+    await page.evaluate(() => window.scrollTo(0, 0));
+    await page.waitForTimeout(3000);
+
+    // Debug: dump visible text and table count
+    const pageDebug = await page.evaluate(() => {
+      // Attempt to pierce shadow DOM for lightning-datatable
+      function getAllTables(root: Document | ShadowRoot): HTMLTableElement[] {
+        const tables = Array.from(root.querySelectorAll("table")) as HTMLTableElement[];
+        const shadowHosts = root.querySelectorAll("*");
+        for (const host of shadowHosts) {
+          if ((host as any).shadowRoot) {
+            tables.push(...getAllTables((host as any).shadowRoot));
+          }
+        }
+        return tables;
+      }
+      const allTables = getAllTables(document);
+      return {
+        url: window.location.href,
+        tableCount: allTables.length,
+        tables: allTables.map((t, i) => ({
+          index: i,
+          headers: Array.from(t.querySelectorAll("th")).map(h => (h as HTMLElement).innerText.trim()).filter(Boolean),
+          rowCount: t.querySelectorAll("tbody tr").length,
+        })),
+        // Sample of visible text to understand page state
+        bodySnippet: document.body.innerText.slice(0, 500),
+      };
     });
-    console.log(`[Scraper] Tables on page for ${clientName}:`, JSON.stringify(tableDebug));
+    console.log(`[Scraper] Page debug for ${clientName}:`, JSON.stringify(pageDebug));
 
-    // ── Find the investment accounts table ──────────────────────────────────
-    // Try specific headers first, then fall back to largest table
+    // ── Find the investment accounts table (including shadow DOM) ───────────
+    // Use Playwright's built-in ability to evaluate inside shadow roots
     const tableIndex = await page.evaluate(() => {
-      const tables = document.querySelectorAll("table");
-      // First pass: look for investment-specific headers
-      for (let i = 0; i < tables.length; i++) {
-        const headers = Array.from(tables[i].querySelectorAll("th")).map(h =>
-          h.innerText.trim().toLowerCase()
+      function getAllTables(root: Document | ShadowRoot): HTMLTableElement[] {
+        const tables = Array.from(root.querySelectorAll("table")) as HTMLTableElement[];
+        const shadowHosts = root.querySelectorAll("*");
+        for (const host of shadowHosts) {
+          if ((host as any).shadowRoot) {
+            tables.push(...getAllTables((host as any).shadowRoot));
+          }
+        }
+        return tables;
+      }
+      const allTables = getAllTables(document);
+      // First pass: investment-specific headers
+      for (let i = 0; i < allTables.length; i++) {
+        const headers = Array.from(allTables[i].querySelectorAll("th")).map(h =>
+          (h as HTMLElement).innerText.trim().toLowerCase()
         );
         if (headers.some(h => h.includes("plan") || h.includes("current value") || h.includes("provider") || h.includes("product"))) {
           return i;
         }
       }
-      // Second pass: return the table with the most rows
+      // Second pass: largest table by row count
       let bestIdx = -1, bestRows = 0;
-      for (let i = 0; i < tables.length; i++) {
-        const rows = tables[i].querySelectorAll("tbody tr").length;
+      for (let i = 0; i < allTables.length; i++) {
+        const rows = allTables[i].querySelectorAll("tbody tr").length;
         if (rows > bestRows) { bestRows = rows; bestIdx = i; }
       }
       return bestRows > 0 ? bestIdx : -1;
     });
 
     if (tableIndex === -1) {
-      console.log(`[Scraper] No table found at all for ${clientName} — page may not have loaded`);
+      console.log(`[Scraper] No table found for ${clientName} after shadow DOM search`);
       await page.close();
       return;
     }
     console.log(`[Scraper] Using table index ${tableIndex} for ${clientName}`);
 
+    // Shadow-DOM-aware table getter (serialised as string for page.evaluate)
+    const GET_TABLES = `(function getAllTables(root){const t=Array.from(root.querySelectorAll('table'));for(const h of root.querySelectorAll('*')){if(h.shadowRoot)t.push(...getAllTables(h.shadowRoot));}return t;})(document)`;
+
     // ── Extract column headers ──────────────────────────────────────────────
-    const headers = await page.evaluate((idx: number) => {
-      return Array.from(document.querySelectorAll("table")[idx].querySelectorAll("th"))
-        .map(h => h.innerText.trim())
-        .filter(h => h.length > 0);
-    }, tableIndex);
+    const headers = await page.evaluate(([idx, expr]) => {
+      const allTables = eval(expr);
+      return Array.from(allTables[idx].querySelectorAll("th"))
+        .map((h: any) => h.innerText.trim())
+        .filter((h: string) => h.length > 0);
+    }, [tableIndex, GET_TABLES] as [number, string]);
 
     // ── Get total portfolio value ───────────────────────────────────────────
     const totalValue = await page.evaluate(() => {
@@ -143,35 +179,33 @@ async function scrapeClient(
     });
 
     // ── Click every expand arrow ────────────────────────────────────────────
-    const clickedCount = await page.evaluate(async (idx: number) => {
-      const table = document.querySelectorAll("table")[idx];
+    const clickedCount = await page.evaluate(([idx, expr]) => {
+      const allTables = eval(expr);
+      const table = allTables[idx];
       const rows = Array.from(table.querySelectorAll("tbody > tr"));
       let clicked = 0;
-      for (const row of rows) {
+      for (const row of rows as HTMLTableRowElement[]) {
         const btn = row.querySelector(
           'td button[aria-expanded="false"], td button[title*="xpand"], td:first-child button'
         ) as HTMLButtonElement | null;
-        if (btn) {
-          btn.click();
-          clicked++;
-          await new Promise(r => setTimeout(r, 700));
-        }
+        if (btn) { btn.click(); clicked++; }
       }
       return clicked;
-    }, tableIndex);
+    }, [tableIndex, GET_TABLES] as [number, string]);
 
     if (clickedCount > 0) {
-      await page.waitForTimeout(clickedCount * 700 + 1500);
+      await page.waitForTimeout(clickedCount * 800 + 2000);
     }
 
     // ── Extract all rows ────────────────────────────────────────────────────
-    const rawRows = await page.evaluate((idx: number) => {
-      const table = document.querySelectorAll("table")[idx];
-      return Array.from(table.querySelectorAll("tbody tr")).map(row => ({
-        cells: Array.from(row.querySelectorAll("td")).map(c => c.innerText.trim()),
+    const rawRows = await page.evaluate(([idx, expr]) => {
+      const allTables = eval(expr);
+      const table = allTables[idx];
+      return Array.from(table.querySelectorAll("tbody tr")).map((row: any) => ({
+        cells: Array.from(row.querySelectorAll("td")).map((c: any) => c.innerText.trim()),
         cellCount: row.querySelectorAll("td").length,
       }));
-    }, tableIndex);
+    }, [tableIndex, GET_TABLES] as [number, string]);
 
     // ── Parse rows into accounts + holdings ────────────────────────────────
     // Upsert client first
