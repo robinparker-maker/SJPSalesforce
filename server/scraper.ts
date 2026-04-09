@@ -97,13 +97,14 @@ async function scrapeFinancialAccount(
   const utFeeder       = extractField(pageText, "UT Feeder?\n");
   const ihtExempt      = extractField(pageText, "IHT Exempt\n");
 
-  // Plan number fallback: grab UT-prefixed number from text
-  const planMatch = pageText.match(/UT\d{9,}/);
+  // Plan number: grab UT-prefixed number from text
+  const planMatch = pageText.match(/UT\d{6,}/);
   const finalPlan = planNumber || (planMatch ? planMatch[0] : faId);
 
-  // Current value: look for GBP pattern
-  const gbpMatch = pageText.match(/GBP\s+([\d,]+\.?\d*)/);
-  const finalValue = currentValue || (gbpMatch ? `£${gbpMatch[1]}` : "");
+  // Current value: "Current Value\nGBP X" is the most reliable pattern
+  const cvMatch = pageText.match(/Current Value\s*\nGBP\s*([\d,]+\.\d{2})/) ||
+                  pageText.match(/GBP\s*([\d,]+\.\d{2})/);
+  const finalValue = cvMatch ? `£${cvMatch[1]}` : currentValue;
 
   const accountDbId = `${clientId}_${finalPlan}`;
 
@@ -194,59 +195,44 @@ async function scrapeClient(
     });
     await page.waitForTimeout(10000);
 
-    // ── Collect all FinancialAccount IDs from the related list ────────────────
-    // They appear as tabs in the console — each has a Salesforce record ID
-    // Also check for links in the page body
+    // ── Scroll to load all related list items ────────────────────────────────
+    for (let scroll = 0; scroll < 5; scroll++) {
+      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+      await page.waitForTimeout(2000);
+    }
+    await page.evaluate(() => window.scrollTo(0, 0));
+    await page.waitForTimeout(2000);
+
+    // ── Collect FinancialAccount IDs only (not Securities or other objects) ───
     const faIds = await page.evaluate(() => {
       const seen = new Set<string>();
       const results: string[] = [];
-
-      // Method 1: links in page
-      const links = Array.from(document.querySelectorAll('a[href*="FinancialAccount"], a[href*="FinServ"]'));
+      // Only match FinancialAccount links — exclude Securities
+      const links = Array.from(document.querySelectorAll('a[href*="FinancialAccount"]'));
       for (const link of links) {
         const href = (link as HTMLAnchorElement).href;
-        const m = href.match(/\/([a-zA-Z0-9]{15,18})(?:\/view)?/);
-        if (m && !seen.has(m[1]) && m[1] !== window.location.pathname.split("/")[4]) {
-          seen.add(m[1]);
-          results.push(m[1]);
-        }
-      }
-
-      // Method 2: tab titles that look like plan numbers (UT...)
-      const tabs = Array.from(document.querySelectorAll('[title*="Financial Account"]'));
-      for (const tab of tabs) {
-        const href = (tab as HTMLAnchorElement).href || tab.closest('a')?.href || "";
-        const m = href.match(/\/([a-zA-Z0-9]{15,18})(?:\/view)?/);
+        // Must contain FinancialAccount (not Securities) and have a record ID
+        if (href.includes("Securities")) continue;
+        const m = href.match(/\/([a-zA-Z0-9]{15,18})\/view/);
         if (m && !seen.has(m[1])) {
           seen.add(m[1]);
           results.push(m[1]);
         }
       }
-
       return results;
     });
 
     console.log(`[Scraper] Found ${faIds.length} FinancialAccount IDs on page: ${JSON.stringify(faIds)}`);
 
-    // ── Get total portfolio value from page text ───────────────────────────────
-    const mainPageText = await page.locator("body").innerText().catch(() => "");
-    const totalMatch = mainPageText.match(/£([\d,]+\.\d{2})/g);
-    // The largest £ value is likely the total
-    let totalValue: string | null = null;
-    if (totalMatch) {
-      const values = totalMatch.map(v => parseFloat(v.replace(/[£,]/g, "")));
-      const max = Math.max(...values);
-      totalValue = `£${max.toLocaleString("en-GB", { minimumFractionDigits: 2 })}`;
-    }
-
-    // Upsert client
+    // Upsert client first — total value summed after visiting all FA records
     storage.upsertClient({
       id: accountId,
       name: cleanName,
-      totalValue: totalValue ?? undefined,
+      totalValue: undefined,
       lastScraped: new Date().toISOString(),
     });
     storage.deleteAccountsByClient(accountId);
+
 
     // ── If no FA IDs found via links, try querying the SOQL-like API path ────
     // Fall back: open the FinancialAccount list filtered by parent account
@@ -290,7 +276,22 @@ async function scrapeClient(
       await page.waitForTimeout(1000);
     }
 
-    console.log(`[Scraper] ✓ ${cleanName} — ${accountsFound} accounts, ${holdingsFound} holdings`);
+    // Update client total value by summing all scraped account values
+    const allAccounts = storage.getAccountsByClient(accountId);
+    const total = allAccounts.reduce((sum, a) => {
+      const v = parseFloat((a.currentValue ?? "").replace(/[£,\s]/g, ""));
+      return isNaN(v) ? sum : sum + v;
+    }, 0);
+    if (total > 0) {
+      storage.upsertClient({
+        id: accountId,
+        name: cleanName,
+        totalValue: `£${total.toLocaleString("en-GB", { minimumFractionDigits: 2 })}`,
+        lastScraped: new Date().toISOString(),
+      });
+    }
+
+    console.log(`[Scraper] ✓ ${cleanName} — ${accountsFound} accounts, ${holdingsFound} holdings, total £${total.toLocaleString("en-GB")}`);
   } finally {
     await page.close();
   }
