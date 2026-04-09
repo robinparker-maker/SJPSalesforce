@@ -32,10 +32,18 @@ export async function saveSession(context: BrowserContext) {
 async function harvestAccountIds(context: BrowserContext): Promise<{ id: string; name: string }[]> {
   const page = await context.newPage();
   await page.goto(`${BASE_URL}/lightning/o/Account/list`, {
-    waitUntil: "networkidle",
-    timeout: 30000,
+    waitUntil: "domcontentloaded",
+    timeout: 60000,
   });
-  await page.waitForTimeout(3000);
+  // Wait for Lightning to fully render
+  await page.waitForTimeout(8000);
+
+  // Detect SSO redirect — if we're not on Lightning, session has expired
+  const currentUrl = page.url();
+  if (!currentUrl.includes("lightning.force.com") && !currentUrl.includes("sjp2")) {
+    await page.close();
+    throw new Error(`Session expired — redirected to: ${currentUrl}. Please log in again.`);
+  }
 
   // Collect all client links from the list — they link to /lightning/r/Account/{ID}/view
   const accounts = await page.evaluate(() => {
@@ -70,11 +78,11 @@ async function scrapeClient(
   const page = await context.newPage();
   try {
     await page.goto(`${BASE_URL}/lightning/r/Account/${accountId}/view`, {
-      waitUntil: "networkidle",
-      timeout: 30000,
+      waitUntil: "domcontentloaded",
+      timeout: 60000,
     });
-    await page.waitForSelector("table", { timeout: 20000 });
-    await page.waitForTimeout(3000);
+    await page.waitForTimeout(8000);
+    await page.waitForSelector("table", { timeout: 30000 });
 
     // ── Find the investment accounts table ──────────────────────────────────
     const tableIndex = await page.evaluate(() => {
