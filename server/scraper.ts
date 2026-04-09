@@ -195,33 +195,50 @@ async function scrapeClient(
     });
     await page.waitForTimeout(10000);
 
-    // ── Scroll to load all related list items ────────────────────────────────
-    for (let scroll = 0; scroll < 5; scroll++) {
-      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-      await page.waitForTimeout(2000);
-    }
-    await page.evaluate(() => window.scrollTo(0, 0));
-    await page.waitForTimeout(2000);
+    // ── Click "View All" on the Financial Accounts related list ────────────────
+    // The main page only shows a preview — click View All to get all records
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    await page.waitForTimeout(3000);
 
-    // ── Collect FinancialAccount IDs only (not Securities or other objects) ───
-    const faIds = await page.evaluate(() => {
+    // Try to find and click a "View All" link near the Financial Accounts section
+    const viewAllClicked = await page.evaluate(() => {
+      const links = Array.from(document.querySelectorAll('a, button'));
+      for (const el of links) {
+        const text = (el as HTMLElement).innerText?.trim().toLowerCase();
+        const title = el.getAttribute('title')?.toLowerCase() ?? '';
+        if ((text === 'view all' || title.includes('view all')) && 
+            (el.closest('[data-component-id*="Financial"]') || el.closest('[class*="financial"]') || 
+             el.closest('section') || el.closest('article'))) {
+          (el as HTMLElement).click();
+          return true;
+        }
+      }
+      // Fallback: click any "View All" link
+      for (const el of links) {
+        const text = (el as HTMLElement).innerText?.trim().toLowerCase();
+        if (text === 'view all') {
+          (el as HTMLElement).click();
+          return true;
+        }
+      }
+      return false;
+    });
+    console.log(`[Scraper] View All clicked: ${viewAllClicked}`);
+    if (viewAllClicked) await page.waitForTimeout(5000);
+
+    // ── Collect FinancialAccount IDs from current page ───────────────────────
+    let faIds = await page.evaluate(() => {
       const seen = new Set<string>();
       const results: string[] = [];
-      // Only match FinancialAccount links — exclude Securities
       const links = Array.from(document.querySelectorAll('a[href*="FinancialAccount"]'));
       for (const link of links) {
         const href = (link as HTMLAnchorElement).href;
-        // Must contain FinancialAccount (not Securities) and have a record ID
         if (href.includes("Securities")) continue;
         const m = href.match(/\/([a-zA-Z0-9]{15,18})\/view/);
-        if (m && !seen.has(m[1])) {
-          seen.add(m[1]);
-          results.push(m[1]);
-        }
+        if (m && !seen.has(m[1])) { seen.add(m[1]); results.push(m[1]); }
       }
       return results;
     });
-
     console.log(`[Scraper] Found ${faIds.length} FinancialAccount IDs on page: ${JSON.stringify(faIds)}`);
 
     // Upsert client first — total value summed after visiting all FA records
@@ -234,32 +251,31 @@ async function scrapeClient(
     storage.deleteAccountsByClient(accountId);
 
 
-    // ── If no FA IDs found via links, try querying the SOQL-like API path ────
-    // Fall back: open the FinancialAccount list filtered by parent account
-    if (faIds.length === 0) {
-      console.log(`[Scraper] No FA links found on main page — trying FinancialAccount list`);
-      await page.goto(
-        `${BASE_URL}/lightning/o/FinServ__FinancialAccount__c/list`,
-        { waitUntil: "domcontentloaded", timeout: 60000 }
-      );
+    // ── If still only 1 FA ID, navigate directly to the related list URL ───────
+    // Salesforce has a related list URL: /lightning/r/Account/{id}/related/FinServ__FinancialAccounts__r/view
+    if (faIds.length <= 1) {
+      console.log(`[Scraper] Only ${faIds.length} FA IDs found — trying related list URL`);
+      const relatedUrl = `${BASE_URL}/lightning/r/Account/${accountId}/related/FinServ__FinancialAccounts__r/view`;
+      await page.goto(relatedUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
       await page.waitForTimeout(8000);
+      console.log(`[Scraper] Related list URL: ${page.url()}`);
 
-      const listFaIds = await page.evaluate(() => {
+      const relatedFaIds = await page.evaluate(() => {
         const links = Array.from(document.querySelectorAll('a[href*="FinancialAccount"]'));
         const seen = new Set<string>();
         const results: string[] = [];
         for (const link of links) {
           const href = (link as HTMLAnchorElement).href;
-          const m = href.match(/FinancialAccount[^/]*\/([a-zA-Z0-9]{15,18})\/view/);
-          if (m && !seen.has(m[1])) {
-            seen.add(m[1]);
-            results.push(m[1]);
-          }
+          if (href.includes("Securities")) continue;
+          const m = href.match(/\/([a-zA-Z0-9]{15,18})\/view/);
+          if (m && !seen.has(m[1])) { seen.add(m[1]); results.push(m[1]); }
         }
         return results;
       });
-      console.log(`[Scraper] Found ${listFaIds.length} FA IDs from list view`);
-      faIds.push(...listFaIds);
+      console.log(`[Scraper] Found ${relatedFaIds.length} FA IDs from related list URL`);
+      // Merge, keeping existing ones too
+      const seen = new Set(faIds);
+      for (const id of relatedFaIds) { if (!seen.has(id)) { seen.add(id); faIds.push(id); } }
     }
 
     // ── Visit each Financial Account and extract data ─────────────────────────
