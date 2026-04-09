@@ -81,28 +81,48 @@ async function scrapeClient(
       waitUntil: "domcontentloaded",
       timeout: 60000,
     });
-    await page.waitForTimeout(8000);
-    await page.waitForSelector("table", { timeout: 30000 });
+    // Wait for Lightning components to render
+    await page.waitForTimeout(12000);
+
+    // Debug: log all tables found and their headers
+    const tableDebug = await page.evaluate(() => {
+      const tables = document.querySelectorAll("table");
+      return Array.from(tables).map((t, i) => ({
+        index: i,
+        headers: Array.from(t.querySelectorAll("th")).map(h => h.innerText.trim()).filter(Boolean),
+        rowCount: t.querySelectorAll("tbody tr").length,
+      }));
+    });
+    console.log(`[Scraper] Tables on page for ${clientName}:`, JSON.stringify(tableDebug));
 
     // ── Find the investment accounts table ──────────────────────────────────
+    // Try specific headers first, then fall back to largest table
     const tableIndex = await page.evaluate(() => {
       const tables = document.querySelectorAll("table");
+      // First pass: look for investment-specific headers
       for (let i = 0; i < tables.length; i++) {
         const headers = Array.from(tables[i].querySelectorAll("th")).map(h =>
           h.innerText.trim().toLowerCase()
         );
-        if (headers.some(h => h.includes("plan") || h.includes("current value") || h.includes("provider"))) {
+        if (headers.some(h => h.includes("plan") || h.includes("current value") || h.includes("provider") || h.includes("product"))) {
           return i;
         }
       }
-      return -1;
+      // Second pass: return the table with the most rows
+      let bestIdx = -1, bestRows = 0;
+      for (let i = 0; i < tables.length; i++) {
+        const rows = tables[i].querySelectorAll("tbody tr").length;
+        if (rows > bestRows) { bestRows = rows; bestIdx = i; }
+      }
+      return bestRows > 0 ? bestIdx : -1;
     });
 
     if (tableIndex === -1) {
-      console.log(`[Scraper] No investment table found for ${clientName}`);
+      console.log(`[Scraper] No table found at all for ${clientName} — page may not have loaded`);
       await page.close();
       return;
     }
+    console.log(`[Scraper] Using table index ${tableIndex} for ${clientName}`);
 
     // ── Extract column headers ──────────────────────────────────────────────
     const headers = await page.evaluate((idx: number) => {
