@@ -99,6 +99,15 @@ async function scrapeClient(
     // Wait for the component to render — it fetches data via Aura action
     await page.waitForTimeout(15000);
 
+    // Detect SSO redirect — if we see a login page, session has expired
+    const bodyText = await page.locator("body").innerText().catch(() => "");
+    if (bodyText.includes("Use your password instead") || bodyText.includes("Sign in") || bodyText.length < 500) {
+      console.log(`[Scraper] Session expired — SSO login page detected`);
+      // Delete the stale session file so the UI shows session as invalid
+      if (fs.existsSync(SESSION_FILE)) fs.unlinkSync(SESSION_FILE);
+      throw new Error("SJP session expired. Please click 'Re-login to SJP' and complete SSO again.");
+    }
+
     // Click all expand/chevron buttons to reveal fund holdings
     const expandCount = await page.evaluate(() => {
       const btns = Array.from(document.querySelectorAll(

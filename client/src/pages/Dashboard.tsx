@@ -397,26 +397,23 @@ export default function Dashboard() {
         </div>
         <div className="flex items-center gap-3">
           <ScrapeStatusBadge log={scrapeStatus?.latest ?? null} />
-          {!sessionOk ? (
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={() => setShowLoginModal(true)}
-              data-testid="button-login"
-            >
-              Login to SJP
-            </Button>
-          ) : (
-            <Button
-              size="sm"
-              onClick={() => scrapeMutation.mutate()}
-              disabled={scrapeMutation.isPending || scrapeStatus?.inProgress}
-              data-testid="button-sync"
-              className="bg-primary text-primary-foreground hover:bg-primary/90"
-            >
-              {scrapeStatus?.inProgress ? "Syncing…" : "Sync All Clients"}
-            </Button>
-          )}
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => setShowLoginModal(true)}
+            data-testid="button-login"
+          >
+            {sessionOk ? "Re-login to SJP" : "Login to SJP"}
+          </Button>
+          <Button
+            size="sm"
+            onClick={() => scrapeMutation.mutate()}
+            disabled={scrapeMutation.isPending || scrapeStatus?.inProgress}
+            data-testid="button-sync"
+            className="bg-primary text-primary-foreground hover:bg-primary/90"
+          >
+            {scrapeStatus?.inProgress ? "Syncing…" : "Sync All Clients"}
+          </Button>
         </div>
       </header>
 
