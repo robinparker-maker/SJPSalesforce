@@ -91,12 +91,20 @@ async function scrapeClient(
   const page = await context.newPage();
   try {
     const cleanName = clientName.replace(/^Account\s*/i, "").replace(/\s*\|.*$/, "").trim();
+    // Step 1: Load the Account page first to establish Lightning context
+    console.log(`[Scraper] Loading account page for ${cleanName}`);
+    await page.goto(`${BASE_URL}/lightning/r/Account/${accountId}/view`, {
+      waitUntil: "domcontentloaded",
+      timeout: 60000,
+    });
+    await page.waitForTimeout(10000);
+
+    // Step 2: Navigate to the investment component via the hash URL
     const url = buildInvestmentUrl(accountId);
-    console.log(`[Scraper] Loading investment component for ${cleanName}`);
-
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
-
-    // Wait for the component to render — it fetches data via Aura action
+    console.log(`[Scraper] Navigating to investment component`);
+    await page.evaluate((navUrl) => {
+      window.location.href = navUrl;
+    }, url);
     await page.waitForTimeout(15000);
 
     // Detect SSO redirect — if we see a login page, session has expired
