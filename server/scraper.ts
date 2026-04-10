@@ -20,32 +20,6 @@ export async function saveSession(context: BrowserContext) {
   fs.writeFileSync(SESSION_FILE, JSON.stringify(state, null, 2));
 }
 
-// ── Build the Investment Accounts component URL for a given Account ID ────────
-function buildInvestmentUrl(accountId: string): string {
-  const payload = {
-    componentDef: "c:financialAccountList",
-    attributes: {
-      recordId: accountId,
-      title: "Investment Accounts",
-      iconName: "custom:custom16",
-      recordTypeId: "01208000000gXQrAAM",
-      recordtypesForFinancialAccounts: "Investment_SJP_Automated,Investments",
-      fieldSetForFinancialAccount: "InvestmentAccountForComponent",
-      fieldSetForFinancialHolding: "Fund_Assets_Holdings_Component",
-      defaultRecordType: "Investments",
-      fullView: true,
-      iconSize: "medium",
-      includeInActive: false,
-      TotalFieldName: "CurrentValue_in_GBP__c",
-    },
-    state: {
-      ws: `/lightning/r/Account/${accountId}/view`,
-    },
-  };
-  const b64 = Buffer.from(JSON.stringify(payload)).toString("base64");
-  return `${BASE_URL}/one/one.app#${b64}`;
-}
-
 // ── Harvest client Account IDs from list view ────────────────────────────────
 async function harvestAccountIds(context: BrowserContext): Promise<{ id: string; name: string }[]> {
   const page = await context.newPage();
@@ -82,7 +56,7 @@ async function harvestAccountIds(context: BrowserContext): Promise<{ id: string;
   return accounts;
 }
 
-// ── Scrape one client using the Investment Accounts component URL ──────────────
+// ── Scrape one client ─────────────────────────────────────────────────────────
 async function scrapeClient(
   context: BrowserContext,
   accountId: string,
@@ -91,35 +65,127 @@ async function scrapeClient(
   const page = await context.newPage();
   try {
     const cleanName = clientName.replace(/^Account\s*/i, "").replace(/\s*\|.*$/, "").trim();
-    // Step 1: Load the Account page first to establish Lightning context
     console.log(`[Scraper] Loading account page for ${cleanName}`);
+
     await page.goto(`${BASE_URL}/lightning/r/Account/${accountId}/view`, {
       waitUntil: "domcontentloaded",
       timeout: 60000,
     });
-    await page.waitForTimeout(10000);
+    await page.waitForTimeout(12000);
 
-    // Step 2: Navigate to the investment component via the hash URL
-    const url = buildInvestmentUrl(accountId);
-    console.log(`[Scraper] Navigating to investment component`);
-    await page.evaluate((navUrl) => {
-      window.location.href = navUrl;
-    }, url);
-    await page.waitForTimeout(15000);
-
-    // Detect SSO redirect — if we see a login page, session has expired
-    const bodyText = await page.locator("body").innerText().catch(() => "");
-    if (bodyText.includes("Use your password instead") || bodyText.includes("Sign in") || bodyText.length < 500) {
+    // Detect SSO redirect
+    const earlyText = await page.locator("body").innerText().catch(() => "");
+    if (earlyText.includes("Use your password instead") || earlyText.includes("Sign in") || earlyText.length < 300) {
       console.log(`[Scraper] Session expired — SSO login page detected`);
-      // Delete the stale session file so the UI shows session as invalid
       if (fs.existsSync(SESSION_FILE)) fs.unlinkSync(SESSION_FILE);
       throw new Error("SJP session expired. Please click 'Re-login to SJP' and complete SSO again.");
     }
 
-    // Click all expand/chevron buttons to reveal fund holdings
+    // Screenshot the account page
+    await page.screenshot({ path: path.join(DATA_DIR, `debug-account-${accountId}.png`), fullPage: true });
+
+    // ── Find and click the "Investment Accounts" section header or "View All" ─
+    // Log all visible link/button text that might be clickable
+    const clickableItems = await page.evaluate(() => {
+      const items: { text: string; tag: string; href: string }[] = [];
+      const els = document.querySelectorAll('a, button, [role="button"], h2, span.slds-card__header-title');
+      for (const el of Array.from(els)) {
+        const text = (el as HTMLElement).innerText?.trim().slice(0, 80);
+        if (text && (
+          text.toLowerCase().includes("investment") ||
+          text.toLowerCase().includes("financial") ||
+          text.toLowerCase().includes("view all") ||
+          text.toLowerCase().includes("account") && text.length < 30
+        )) {
+          items.push({
+            text,
+            tag: el.tagName,
+            href: (el as HTMLAnchorElement).href || "",
+          });
+        }
+      }
+      return items;
+    });
+    console.log(`[Scraper] Clickable items matching investment/financial:`, JSON.stringify(clickableItems));
+
+    // Try clicking "Investment Accounts" header or nearby "View All" link
+    let investmentComponentLoaded = false;
+
+    // Strategy 1: Click the "Investment Accounts" title text which opens the component
+    const investmentLink = await page.evaluate(() => {
+      const allEls = document.querySelectorAll('a, button, span, h2');
+      for (const el of Array.from(allEls)) {
+        const text = (el as HTMLElement).innerText?.trim();
+        if (text === "Investment Accounts" && (el.tagName === "A" || el.tagName === "BUTTON" || el.tagName === "SPAN")) {
+          (el as HTMLElement).click();
+          return text;
+        }
+      }
+      return null;
+    });
+
+    if (investmentLink) {
+      console.log(`[Scraper] Clicked: "${investmentLink}"`);
+      await page.waitForTimeout(10000);
+      investmentComponentLoaded = true;
+    }
+
+    // Strategy 2: If that didn't work, look for "View All" near investment section
+    if (!investmentLink) {
+      const viewAllClicked = await page.evaluate(() => {
+        const viewAlls = document.querySelectorAll('a');
+        for (const a of Array.from(viewAlls)) {
+          const text = a.innerText?.trim().toLowerCase();
+          if (text === "view all" || text.includes("view all")) {
+            // Check if it's near an "Investment" label
+            const section = a.closest('article, section, div[class*="card"]');
+            if (section) {
+              const sectionText = (section as HTMLElement).innerText;
+              if (sectionText.includes("Investment") || sectionText.includes("Financial")) {
+                a.click();
+                return true;
+              }
+            }
+          }
+        }
+        // Fallback: click first "View All"
+        for (const a of Array.from(viewAlls)) {
+          if (a.innerText?.trim().toLowerCase() === "view all") {
+            a.click();
+            return true;
+          }
+        }
+        return false;
+      });
+
+      if (viewAllClicked) {
+        console.log(`[Scraper] Clicked View All`);
+        await page.waitForTimeout(10000);
+        investmentComponentLoaded = true;
+      }
+    }
+
+    // Screenshot after navigation attempt
+    await page.screenshot({ path: path.join(DATA_DIR, `debug-invest-${accountId}.png`), fullPage: true });
+
+    // Get page text
+    const pageText = await page.locator("body").innerText().catch(() => "");
+    console.log(`[Scraper] Page text length: ${pageText.length}`);
+
+    // Log section around £ values or plan numbers
+    const gbpIdx = pageText.indexOf("GBP");
+    const planIdx = pageText.match(/UT\d{6}|IB\d{6}|IS\d{6}|PE\d{6}/);
+    const startIdx = Math.max(0, Math.min(gbpIdx > 0 ? gbpIdx - 200 : 99999, planIdx?.index ?? 99999) - 50);
+    if (startIdx < pageText.length) {
+      console.log(`[Scraper] Data section:`, pageText.slice(startIdx, startIdx + 3000));
+    } else {
+      console.log(`[Scraper] First 2000 chars:`, pageText.slice(0, 2000));
+    }
+
+    // ── Click all expand arrows ─────────────────────────────────────────────────
     const expandCount = await page.evaluate(() => {
       const btns = Array.from(document.querySelectorAll(
-        'button[aria-expanded="false"], td button, .slds-button_icon'
+        'button[aria-expanded="false"], td button[title*="xpand"], td button[title*="Show"]'
       ));
       let clicked = 0;
       for (const btn of btns) {
@@ -128,19 +194,15 @@ async function scrapeClient(
       return clicked;
     });
     console.log(`[Scraper] Clicked ${expandCount} expand buttons`);
-    if (expandCount > 0) await page.waitForTimeout(expandCount * 300 + 3000);
+    if (expandCount > 0) await page.waitForTimeout(expandCount * 500 + 3000);
 
-    // Screenshot for debugging
-    await page.screenshot({ path: path.join(DATA_DIR, `debug-invest-${accountId}.png`), fullPage: true });
+    // Get final page text after expanding
+    const finalText = expandCount > 0
+      ? await page.locator("body").innerText().catch(() => pageText)
+      : pageText;
 
-    // Get the full rendered text
-    const pageText = await page.locator("body").innerText().catch(() => "");
-    console.log(`[Scraper] Page text length: ${pageText.length}`);
-    console.log(`[Scraper] First 2000 chars:`, pageText.slice(0, 2000));
-
-    // ── Find the total from the component ─────────────────────────────────────
-    const totalMatch = pageText.match(/Total[:\s]*£?([\d,]+\.\d{2})/i) ||
-                       pageText.match(/£([\d,]+\.\d{2})/);
+    // ── Extract total ─────────────────────────────────────────────────────────
+    const totalMatch = finalText.match(/Total[:\s]*(?:GBP\s*)?£?([\d,]+\.\d{2})/i);
     const totalValue = totalMatch ? `£${totalMatch[1]}` : null;
 
     // Upsert client
@@ -152,28 +214,18 @@ async function scrapeClient(
     });
     storage.deleteAccountsByClient(accountId);
 
-    // ── Parse the investment accounts table ────────────────────────────────────
-    // The c:financialAccountList component renders a table with:
-    // Columns: Plan Number | Product | Provider | Current Value | Status | Primary Owner | Ownership Type | UT Feeder | IHT Exempt
-    // Expanded rows: Fund Name | Price | Units | Valuation | % Invested | Security ID
-
-    // Try structured table extraction first
+    // ── Extract from tables (including shadow DOM) ─────────────────────────────
     const tableData = await page.evaluate(() => {
       const allTables: { headers: string[]; rows: string[][] }[] = [];
-
-      // Search both regular DOM and shadow DOM
       function findTables(root: Document | ShadowRoot | Element) {
-        const tables = root.querySelectorAll("table");
-        for (const table of Array.from(tables)) {
+        for (const table of Array.from(root.querySelectorAll("table"))) {
           const headers = Array.from(table.querySelectorAll("th"))
-            .map(h => (h as HTMLElement).innerText.trim())
-            .filter(Boolean);
+            .map(h => (h as HTMLElement).innerText.trim()).filter(Boolean);
           const rows = Array.from(table.querySelectorAll("tbody tr"))
             .map(row => Array.from(row.querySelectorAll("td")).map(c => (c as HTMLElement).innerText.trim()))
             .filter(row => row.some(c => c.length > 0));
           if (rows.length > 0) allTables.push({ headers, rows });
         }
-        // Recurse into shadow roots
         for (const el of Array.from(root.querySelectorAll("*"))) {
           if ((el as any).shadowRoot) findTables((el as any).shadowRoot);
         }
@@ -184,27 +236,28 @@ async function scrapeClient(
 
     console.log(`[Scraper] Found ${tableData.length} table(s)`);
     for (const t of tableData) {
-      console.log(`[Scraper] Table: ${t.headers.length} headers, ${t.rows.length} rows`);
-      console.log(`[Scraper] Headers: ${JSON.stringify(t.headers)}`);
-      if (t.rows[0]) console.log(`[Scraper] Row 0: ${JSON.stringify(t.rows[0])}`);
+      console.log(`[Scraper] Table: headers=${JSON.stringify(t.headers)}, rows=${t.rows.length}`);
+      if (t.rows[0]) console.log(`[Scraper] First row: ${JSON.stringify(t.rows[0])}`);
     }
 
     let accountsFound = 0;
     let holdingsFound = 0;
 
-    // Parse investment accounts table
     for (const { headers, rows } of tableData) {
       const hLower = headers.map(h => h.toLowerCase());
-      const hasPlan = hLower.some(h => h.includes("plan") || h.includes("product") || h.includes("provider") || h.includes("current value"));
-      if (!hasPlan && tableData.length > 1) continue;
+      const isPlanTable = hLower.some(h =>
+        h.includes("plan") || h.includes("product") || h.includes("provider") || h.includes("current value")
+      );
+      if (!isPlanTable && tableData.length > 1) continue;
 
       let currentAccountId: string | null = null;
       const headerCount = headers.length;
 
       for (const cells of rows) {
-        // Account row: has same number of cells as headers, first cell is plan number
-        if (cells.length >= headerCount - 1 && /^\d{5,}/.test(cells[0])) {
-          const planNumber = cells[0];
+        // Account row: first cell matches plan number pattern (UT/IB/IS/PE + digits)
+        const firstCell = cells[0] ?? "";
+        if (/^(UT|IB|IS|PE|PP)?\d{5,}/.test(firstCell) && cells.length >= Math.min(headerCount, 4)) {
+          const planNumber = firstCell;
           const accountDbId = `${accountId}_${planNumber}`;
           currentAccountId = accountDbId;
 
@@ -223,11 +276,11 @@ async function scrapeClient(
           });
           accountsFound++;
         }
-        // Holding row: fewer cells, nested under an account, first cell is fund name
-        else if (currentAccountId && cells.length >= 2 && cells[0].length > 2 && !/^\d{5,}/.test(cells[0])) {
+        // Holding row: fund name + price data, under current account
+        else if (currentAccountId && cells.length >= 2 && firstCell.length > 2 && !firstCell.match(/^(UT|IB|IS|PE|PP)?\d{5,}/)) {
           storage.insertHolding({
             accountId: currentAccountId,
-            fundName: cells[0] ?? "",
+            fundName: firstCell,
             price: cells[1] ?? "",
             units: cells[2] ?? "",
             valuation: cells[3] ?? "",
@@ -239,22 +292,19 @@ async function scrapeClient(
       }
     }
 
-    // ── Fallback: text-based parsing if no table found ─────────────────────────
+    // ── Text fallback if no tables ──────────────────────────────────────────────
     if (accountsFound === 0) {
       console.log(`[Scraper] No table parsed — trying text-based extraction`);
-      const lines = pageText.split("\n").map(l => l.trim()).filter(l => l.length > 0);
-
+      const lines = finalText.split("\n").map(l => l.trim()).filter(l => l.length > 0);
       let currentAccountId: string | null = null;
+
       for (let i = 0; i < lines.length; i++) {
         const line = lines[i];
-
-        // Plan number: 6+ digits
-        if (/^\d{6,}$/.test(line)) {
+        // Plan number patterns: UT004667970001, IB681178860001, 1031929, etc.
+        if (/^(UT|IB|IS|PE|PP)\d{9,}$/.test(line) || /^\d{6,10}$/.test(line)) {
           const planNumber = line;
           const accountDbId = `${accountId}_${planNumber}`;
           currentAccountId = accountDbId;
-
-          // Gather next fields
           storage.upsertAccount({
             id: accountDbId,
             clientId: accountId,
@@ -274,7 +324,7 @@ async function scrapeClient(
       }
     }
 
-    // Update total from sum of accounts
+    // Sum account values for client total
     const allAccounts = storage.getAccountsByClient(accountId);
     const computedTotal = allAccounts.reduce((sum, a) => {
       const v = parseFloat((a.currentValue ?? "").replace(/[£,GBP\s]/g, ""));
